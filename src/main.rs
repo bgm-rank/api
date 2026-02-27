@@ -1,11 +1,13 @@
+mod api;
 mod core;
 mod dal;
 mod services;
 
 use std::sync::Arc;
 
+use crate::api::endpoints::{AppState, sync_season_handler};
 use crate::dal::db::Database;
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{Json, Router, extract::State, routing::{get, post}};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -14,10 +16,10 @@ struct HealthResponse {
     db: String,
 }
 
-async fn health_check(State(db): State<Arc<Database>>) -> Json<HealthResponse> {
+async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
-        db: match db.ping().await {
+        db: match state.db.ping().await {
             Ok(true) => "ok".to_string(),
             Ok(false) => "error".to_string(),
             Err(e) => e.to_string(),
@@ -26,9 +28,11 @@ async fn health_check(State(db): State<Arc<Database>>) -> Json<HealthResponse> {
 }
 
 fn app(db: Arc<Database>) -> Router {
+    let state = AppState::new(db);
     Router::new()
         .route("/health", get(health_check))
-        .with_state(db)
+        .route("/admin/sync/{key}", post(sync_season_handler))
+        .with_state(state)
 }
 
 #[tokio::main]
@@ -75,7 +79,5 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-
-        // TODO: assert response body == {"status": "ok"}
     }
 }
