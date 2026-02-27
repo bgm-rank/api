@@ -29,6 +29,25 @@ impl<'a> SeasonSubjectRepository<'a> {
         Ok(row)
     }
 
+    pub async fn insert_or_ignore(
+        &self,
+        season_subject: CreateSeasonSubject,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO season_subjects (season_id, subject_id)
+            VALUES ($1, $2)
+            ON CONFLICT (season_id, subject_id) DO NOTHING
+            "#,
+        )
+        .bind(season_subject.season_id)
+        .bind(season_subject.subject_id)
+        .execute(self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn find_by_season(&self, season_id: i32) -> Result<Vec<Subject>, sqlx::Error> {
         let row = sqlx::query_as::<_, Subject>(
             r#"
@@ -254,6 +273,35 @@ mod tests {
         let subjects = repo.find_by_season(202601).await?;
 
         assert_eq!(subjects.len(), 3);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_insert_or_ignore(pool: PgPool) -> sqlx::Result<()> {
+        create_test_season(&pool).await?;
+        create_test_subjects(&pool).await?;
+
+        let repo = SeasonSubjectRepository::new(&pool);
+
+        let entry = CreateSeasonSubject {
+            season_id: 202601,
+            subject_id: 515759,
+        };
+
+        // 第一次插入成功
+        repo.insert_or_ignore(entry).await?;
+
+        // 重复插入不报错
+        let entry = CreateSeasonSubject {
+            season_id: 202601,
+            subject_id: 515759,
+        };
+        repo.insert_or_ignore(entry).await?;
+
+        // 确认只有一条记录
+        let subjects = repo.find_by_season(202601).await?;
+        assert_eq!(subjects.len(), 1);
 
         Ok(())
     }

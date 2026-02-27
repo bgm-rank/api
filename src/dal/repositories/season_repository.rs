@@ -28,6 +28,30 @@ impl<'a> SeasonRepository<'a> {
         Ok(row)
     }
 
+    pub async fn upsert(&self, season: CreateSeason) -> Result<Season, sqlx::Error> {
+        let row = sqlx::query_as::<_, Season>(
+            r#"
+            INSERT INTO seasons (season_id, year, season, name)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (season_id)
+            DO UPDATE SET
+                year = EXCLUDED.year,
+                season = EXCLUDED.season,
+                name = COALESCE(EXCLUDED.name, seasons.name),
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING season_id, year, season, name, created_at, updated_at
+            "#,
+        )
+        .bind(season.season_id)
+        .bind(season.year)
+        .bind(season.season)
+        .bind(season.name)
+        .fetch_one(self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
     pub async fn find_by_id(&self, season_id: i32) -> Result<Option<Season>, sqlx::Error> {
         let row = sqlx::query_as::<_, Season>(
             r#"
@@ -65,7 +89,8 @@ impl<'a> SeasonRepository<'a> {
             SET
                 year = COALESCE($2, year),
                 season = COALESCE($3, season),
-                name = COALESCE($4, name)
+                name = COALESCE($4, name),
+                updated_at = CURRENT_TIMESTAMP
             WHERE season_id = $1
             RETURNING season_id, year, season, name, created_at, updated_at
             "#,
@@ -113,6 +138,47 @@ mod tests {
         assert_eq!(season.season_id, 202601);
         assert_eq!(season.year, 2026);
         assert_eq!(season.season, "WINTER");
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_upsert_season(pool: PgPool) -> sqlx::Result<()> {
+        let repo = SeasonRepository::new(&pool);
+
+        // 1. 首次插入
+        let insert_data = CreateSeason {
+            season_id: 202701,
+            year: 2027,
+            season: "WINTER".to_string(),
+            name: Some("2027年手动备注名称".to_string()),
+        };
+
+        let season_inserted = repo.upsert(insert_data).await?;
+        assert_eq!(season_inserted.season_id, 202701);
+        assert_eq!(season_inserted.name, Some("2027年手动备注名称".to_string()));
+
+        // 稍微等待一下确保 updated_at 的时间戳有变化（如果在意微秒级精度的话）
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // 2. 模拟同步数据覆盖，name 传 None
+        let update_data = CreateSeason {
+            season_id: 202701,
+            year: 2027,
+            season: "SPRING".to_string(), // 更新了季节
+            name: None,                   // 同步数据中没有 name
+        };
+
+        let season_updated = repo.upsert(update_data).await?;
+
+        assert_eq!(season_updated.season_id, 202701);
+        assert_eq!(season_updated.season, "SPRING");
+
+        // 关键断言：验证原有的 name 没有被 NULL 覆盖
+        assert_eq!(season_updated.name, Some("2027年手动备注名称".to_string()));
+
+        // 验证 updated_at 被正确更新
+        assert!(season_updated.updated_at > season_inserted.updated_at);
 
         Ok(())
     }

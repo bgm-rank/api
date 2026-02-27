@@ -61,7 +61,8 @@ impl<'a> SubjectRepository<'a> {
                 average_comment = EXCLUDED.average_comment,
                 drop_rate = EXCLUDED.drop_rate,
                 air_weekday = EXCLUDED.air_weekday,
-                meta_tags = EXCLUDED.meta_tags
+                meta_tags = EXCLUDED.meta_tags,
+                updated_at = CURRENT_TIMESTAMP
             RETURNING id, name, name_cn, images_grid, images_large,
                 rank, score, collection_total, average_comment,
                 drop_rate, air_weekday, meta_tags, updated_at
