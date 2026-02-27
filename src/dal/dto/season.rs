@@ -7,7 +7,6 @@ pub struct Season {
     pub season_id: i32,
     pub year: i32,
     pub season: String,
-    pub bangumi_index_id: i32,
     pub name: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
@@ -18,7 +17,6 @@ pub struct CreateSeason {
     pub season_id: i32,
     pub year: i32,
     pub season: String,
-    pub bangumi_index_id: i32,
     pub name: Option<String>,
 }
 
@@ -26,6 +24,5 @@ pub struct CreateSeason {
 pub struct UpdateSeason {
     pub year: Option<i32>,
     pub season: Option<String>,
-    pub bangumi_index_id: Option<i32>,
     pub name: Option<String>,
 }

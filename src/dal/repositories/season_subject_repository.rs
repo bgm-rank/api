@@ -90,7 +90,6 @@ mod tests {
             season_id: 202601,
             year: 2026,
             season: "WINTER".to_string(),
-            bangumi_index_id: 85952,
             name: Some("2026年冬季番".to_string()),
         };
 

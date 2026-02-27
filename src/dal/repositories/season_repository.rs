@@ -13,15 +13,14 @@ impl<'a> SeasonRepository<'a> {
     pub async fn create(&self, create_season: CreateSeason) -> Result<Season, sqlx::Error> {
         let row = sqlx::query_as::<_, Season>(
             r#"
-            INSERT INTO seasons (season_id, year, season, bangumi_index_id, name)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING season_id, year, season, bangumi_index_id, name, created_at, updated_at
+            INSERT INTO seasons (season_id, year, season, name)
+            VALUES ($1, $2, $3, $4)
+            RETURNING season_id, year, season, name, created_at, updated_at
             "#,
         )
         .bind(create_season.season_id)
         .bind(create_season.year)
         .bind(create_season.season)
-        .bind(create_season.bangumi_index_id)
         .bind(create_season.name)
         .fetch_one(self.pool)
         .await?;
@@ -66,16 +65,14 @@ impl<'a> SeasonRepository<'a> {
             SET
                 year = COALESCE($2, year),
                 season = COALESCE($3, season),
-                bangumi_index_id = COALESCE($4, bangumi_index_id),
-                name = COALESCE($5, name)
+                name = COALESCE($4, name)
             WHERE season_id = $1
-            RETURNING season_id, year, season, bangumi_index_id, name, created_at, updated_at
+            RETURNING season_id, year, season, name, created_at, updated_at
             "#,
         )
         .bind(season_id)
         .bind(update_season.year)
         .bind(update_season.season)
-        .bind(update_season.bangumi_index_id)
         .bind(update_season.name)
         .fetch_one(self.pool)
         .await?;
@@ -109,7 +106,6 @@ mod tests {
             season_id: 202601,
             year: 2026,
             season: "WINTER".to_string(),
-            bangumi_index_id: 85952,
             name: Some("2026年冬季番".to_string()),
         };
 
@@ -130,7 +126,6 @@ mod tests {
             season_id: season_id,
             year: 2025,
             season: "AUTUMN".to_string(),
-            bangumi_index_id: 81501,
             name: Some("2025年秋季番".to_string()),
         };
 
@@ -138,7 +133,6 @@ mod tests {
 
         let season = repo.find_by_id(season_id).await?.unwrap();
         assert_eq!(season.season_id, 202510);
-        assert_eq!(season.bangumi_index_id, 81501);
 
         let not_found = repo.find_by_id(999999).await?;
         assert!(not_found.is_none());
@@ -155,14 +149,12 @@ mod tests {
                 season_id: 202507,
                 year: 2025,
                 season: "SUMMER".to_string(),
-                bangumi_index_id: 78937,
                 name: Some("2025年夏季番".to_string()),
             },
             CreateSeason {
                 season_id: 202504,
                 year: 2025,
                 season: "SPRING".to_string(),
-                bangumi_index_id: 74306,
                 name: Some("2025年春季番".to_string()),
             },
         ];
@@ -186,7 +178,6 @@ mod tests {
             season_id: 202501,
             year: 2025,
             season: "WINTER".to_string(),
-            bangumi_index_id: 67220,
             name: Some("2025年冬季番".to_string()),
         };
 
@@ -195,7 +186,6 @@ mod tests {
         let update_season = UpdateSeason {
             year: None,
             season: None,
-            bangumi_index_id: Some(21834),
             name: Some("UPDATED".to_string()),
         };
 
@@ -203,7 +193,6 @@ mod tests {
 
         assert_eq!(season.year, 2025);
         assert_eq!(season.season, "WINTER");
-        assert_eq!(season.bangumi_index_id, 21834);
         assert_eq!(season.name, Some("UPDATED".to_string()));
 
         Ok(())
@@ -217,7 +206,6 @@ mod tests {
             season_id: 202410,
             year: 2024,
             season: "AUTUMN".to_string(),
-            bangumi_index_id: 64284,
             name: Some("2024年秋季番".to_string()),
         };
 
