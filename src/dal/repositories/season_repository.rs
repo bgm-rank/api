@@ -5,6 +5,7 @@ pub struct SeasonRepository<'a> {
     pool: &'a PgPool,
 }
 
+#[allow(dead_code)]
 impl<'a> SeasonRepository<'a> {
     pub fn new(pool: &'a PgPool) -> Self {
         Self { pool }

@@ -135,6 +135,7 @@ dependencies = [
  "axum",
  "chrono",
  "dotenvy",
+ "log",
  "mockito",
  "reqwest",
  "serde",

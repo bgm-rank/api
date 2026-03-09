@@ -11,6 +11,11 @@ impl Database {
         })
     }
 
+    #[allow(dead_code)]
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }

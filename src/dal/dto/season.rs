@@ -21,6 +21,7 @@ pub struct CreateSeason {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct UpdateSeason {
     pub year: Option<i32>,
     pub season: Option<String>,

@@ -5,6 +5,7 @@ pub struct SeasonSubjectRepository<'a> {
     pool: &'a PgPool,
 }
 
+#[allow(dead_code)]
 impl<'a> SeasonSubjectRepository<'a> {
     pub fn new(pool: &'a PgPool) -> Self {
         Self { pool }
@@ -46,6 +47,60 @@ impl<'a> SeasonSubjectRepository<'a> {
         .await?;
 
         Ok(())
+    }
+
+    pub async fn reconcile(
+        &self,
+        season_id: i32,
+        new_subject_ids: Vec<i32>,
+    ) -> Result<(usize, usize), sqlx::Error> {
+        use std::collections::HashSet;
+
+        let current: HashSet<i32> = self
+            .find_by_season_id(season_id)
+            .await?
+            .into_iter()
+            .collect();
+        let new_set: HashSet<i32> = new_subject_ids.into_iter().collect();
+
+        let to_add: Vec<i32> = new_set.difference(&current).copied().collect();
+        let to_remove: Vec<i32> = current.difference(&new_set).copied().collect();
+
+        let mut tx = self.pool.begin().await?;
+
+        for subject_id in &to_add {
+            sqlx::query(
+                "INSERT INTO season_subjects (season_id, subject_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            )
+            .bind(season_id)
+            .bind(subject_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        if !to_remove.is_empty() {
+            sqlx::query(
+                "DELETE FROM season_subjects WHERE season_id = $1 AND subject_id = ANY($2)",
+            )
+            .bind(season_id)
+            .bind(&to_remove)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok((to_add.len(), to_remove.len()))
+    }
+
+    pub async fn find_by_season_id(&self, season_id: i32) -> Result<Vec<i32>, sqlx::Error> {
+        let ids = sqlx::query_scalar::<_, i32>(
+            "SELECT subject_id FROM season_subjects WHERE season_id = $1",
+        )
+        .bind(season_id)
+        .fetch_all(self.pool)
+        .await?;
+
+        Ok(ids)
     }
 
     pub async fn find_by_season(&self, season_id: i32) -> Result<Vec<Subject>, sqlx::Error> {
@@ -143,6 +198,7 @@ mod tests {
                 score: Some(8.155339805825243),
                 average_comment: Some(0.0),
                 air_weekday: Some("星期五".to_string()),
+                ..Default::default()
             },
             CreateSubject {
                 id: 443106,
@@ -167,6 +223,7 @@ mod tests {
                 score: Some(7.285714285714286),
                 average_comment: Some(0.0),
                 air_weekday: Some("星期一".to_string()),
+                ..Default::default()
             },
             CreateSubject {
                 id: 517057,
@@ -191,6 +248,7 @@ mod tests {
                 score: Some(5.333333333333333),
                 average_comment: Some(0.0),
                 air_weekday: Some("星期三".to_string()),
+                ..Default::default()
             },
             CreateSubject {
                 id: 548818,
@@ -214,12 +272,73 @@ mod tests {
                 score: Some(8.11111111111111),
                 average_comment: Some(0.0),
                 air_weekday: Some("星期六".to_string()),
+                ..Default::default()
             },
         ];
 
         for create_subject in create_subjects.into_iter() {
             repo.create(create_subject).await?;
         }
+
+        Ok(())
+    }
+
+    // T014 🔴 reconcile 红灯测试
+    #[sqlx::test]
+    async fn test_reconcile(pool: PgPool) -> sqlx::Result<()> {
+        create_test_season(&pool).await?;
+        create_test_subjects(&pool).await?;
+
+        let repo = SeasonSubjectRepository::new(&pool);
+
+        // 初始关联：A=443106, B=515759, C=517057
+        for sid in [443106, 515759, 517057] {
+            repo.create(CreateSeasonSubject {
+                season_id: 202601,
+                subject_id: sid,
+            })
+            .await?;
+        }
+
+        // reconcile: 保留 B/C, 添加 D=548818, 删除 A=443106
+        let (added, removed) = repo.reconcile(202601, vec![515759, 517057, 548818]).await?;
+
+        assert_eq!(added, 1);
+        assert_eq!(removed, 1);
+
+        let remaining = repo.find_by_season_id(202601).await?;
+        assert!(!remaining.contains(&443106), "A 应被删除");
+        assert!(remaining.contains(&548818), "D 应被添加");
+        assert!(remaining.contains(&515759), "B 应保留");
+        assert!(remaining.contains(&517057), "C 应保留");
+
+        Ok(())
+    }
+
+    // T006 🔴 find_by_season_id 红灯测试
+    #[sqlx::test]
+    async fn test_find_by_season_id(pool: PgPool) -> sqlx::Result<()> {
+        create_test_season(&pool).await?;
+        create_test_subjects(&pool).await?;
+
+        let repo = SeasonSubjectRepository::new(&pool);
+
+        repo.create(CreateSeasonSubject {
+            season_id: 202601,
+            subject_id: 443106,
+        })
+        .await?;
+        repo.create(CreateSeasonSubject {
+            season_id: 202601,
+            subject_id: 515759,
+        })
+        .await?;
+
+        let subject_ids = repo.find_by_season_id(202601).await?;
+
+        assert_eq!(subject_ids.len(), 2);
+        assert!(subject_ids.contains(&443106));
+        assert!(subject_ids.contains(&515759));
 
         Ok(())
     }

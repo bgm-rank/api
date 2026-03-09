@@ -5,9 +5,10 @@ mod services;
 
 use std::sync::Arc;
 
-use crate::api::endpoints::{AppState, sync_season_handler};
+use crate::api::endpoints::{AppState, admin_router, get_season_subjects, list_seasons};
+use crate::core::scheduler::SchedulerService;
 use crate::dal::db::Database;
-use axum::{Json, Router, extract::State, routing::{get, post}};
+use axum::{Json, Router, extract::State, routing::get};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -29,10 +30,16 @@ async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
 
 fn app(db: Arc<Database>) -> Router {
     let state = AppState::new(db);
+    let admin = admin_router(state.clone());
     Router::new()
         .route("/health", get(health_check))
-        .route("/admin/sync/{key}", post(sync_season_handler))
+        .route("/api/seasons", get(list_seasons))
+        .route(
+            "/api/seasons/{season_id}/subjects",
+            get(get_season_subjects),
+        )
         .with_state(state)
+        .merge(admin)
 }
 
 #[tokio::main]
@@ -47,6 +54,13 @@ async fn main() {
     let database_url = std::env::var("DATABASE_URL").unwrap();
     let db = Database::new(&database_url).await.unwrap();
     let db = Arc::new(db);
+
+    let scheduler = SchedulerService::new(Arc::clone(&db));
+    tokio::spawn(async move {
+        if let Err(e) = scheduler.run().await {
+            log::error!("Scheduler error: {:#}", e);
+        }
+    });
 
     axum::serve(listener, app(db))
         .await

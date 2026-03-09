@@ -63,7 +63,7 @@ impl SeasonDataClient {
             .unwrap();
 
         Self {
-            client: client,
+            client,
             url: Arc::from(reqwest::Url::parse(&url.into()).unwrap()),
         }
     }
@@ -103,7 +103,6 @@ impl SeasonDataClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mockito::*;
 
     #[tokio::test]
     async fn test_fetch_all_parses_correctly() {

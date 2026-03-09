@@ -32,7 +32,7 @@ impl BangumiClient {
             .unwrap();
 
         Self {
-            client: client,
+            client,
             base_url: Arc::from(reqwest::Url::parse(BANGUMI_API_BASE).unwrap()),
         }
     }

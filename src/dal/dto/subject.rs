@@ -25,7 +25,7 @@ pub struct Subject {
     pub last_updated_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct CreateSubject {
     pub id: i32,
     pub name: Option<String>,
@@ -39,9 +39,12 @@ pub struct CreateSubject {
     pub drop_rate: Option<f64>,
     pub air_weekday: Option<String>,
     pub meta_tags: Vec<String>,
+    pub media_type: Option<String>,
+    pub rating: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct UpdateSubject {
     pub name: Option<String>,
     pub name_cn: Option<String>,

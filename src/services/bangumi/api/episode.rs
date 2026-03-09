@@ -1,6 +1,7 @@
 use crate::services::bangumi::{BangumiClient, schemas::*};
 use anyhow::{Context, Result};
 
+#[allow(dead_code)]
 impl BangumiClient {
     pub async fn get_episodes(
         &self,
@@ -23,7 +24,7 @@ impl BangumiClient {
         Returns:
             PagedEpisode: 分页剧集数据
         */
-        let url = self.base_url.join(&format!("/v0/episodes")).unwrap();
+        let url = self.base_url.join("/v0/episodes").unwrap();
 
         let response = self
             .client
