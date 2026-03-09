@@ -1,4 +1,4 @@
-use chrono::NaiveDateTime;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
@@ -16,7 +16,13 @@ pub struct Subject {
     pub drop_rate: Option<f64>,
     pub air_weekday: Option<String>,
     pub meta_tags: Vec<String>,
+    #[sqlx(default)]
+    pub media_type: Option<String>,
+    #[sqlx(default)]
+    pub rating: Option<String>,
     pub updated_at: NaiveDateTime,
+    #[sqlx(default)]
+    pub last_updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize)]

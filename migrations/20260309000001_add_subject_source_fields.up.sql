@@ -1,0 +1,3 @@
+ALTER TABLE subjects
+  ADD COLUMN media_type VARCHAR(20),
+  ADD COLUMN rating VARCHAR(20);
