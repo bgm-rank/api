@@ -6,6 +6,7 @@ use crate::dal::{SeasonRepository, SeasonSubjectRepository, SubjectRepository};
 use crate::services::bangumi::{BangumiClient, Subject as BangumiSubject};
 use crate::services::season_data::{MediaType, Rating, SeasonDataClient};
 
+#[derive(Debug)]
 pub struct SyncResult {
     pub season_id: i32,
     pub added: usize,
@@ -207,6 +208,66 @@ fn to_create_subject(s: BangumiSubject) -> CreateSubject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T019 — SyncService::create_and_sync / resync
+    #[test]
+    fn test_create_and_sync_invalid_month_returns_err() {
+        // create_and_sync 内部调用 month_to_season，无效月份应立即返回 Err
+        // 使用 block_on 避免 tokio runtime 依赖 DATABASE_URL
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        dotenvy::dotenv().ok();
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(u) => u,
+            Err(_) => return, // CI 无数据库时跳过
+        };
+        rt.block_on(async {
+            let db = Arc::new(Database::new(&database_url).await.unwrap());
+            let svc = SyncService::new(db);
+            let result = svc.create_and_sync(2026, 2, None).await;
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("Invalid month"));
+        });
+    }
+
+    #[tokio::test]
+    async fn test_resync_unknown_season_returns_err() {
+        dotenvy::dotenv().ok();
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let db = Arc::new(Database::new(&database_url).await.unwrap());
+        let svc = SyncService::new(db);
+        let result = svc.resync(999999).await;
+        assert!(result.is_err());
+    }
+
+    // T037 — SyncService::find_orphans / delete_orphans
+    #[tokio::test]
+    async fn test_find_orphans_returns_ok() {
+        dotenvy::dotenv().ok();
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let db = Arc::new(Database::new(&database_url).await.unwrap());
+        let svc = SyncService::new(db);
+        let result = svc.find_orphans().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_delete_orphans_returns_ok() {
+        dotenvy::dotenv().ok();
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let db = Arc::new(Database::new(&database_url).await.unwrap());
+        let svc = SyncService::new(db);
+        let result = svc.delete_orphans().await;
+        assert!(result.is_ok());
+    }
 
     #[test]
     fn test_month_to_season_winter() {

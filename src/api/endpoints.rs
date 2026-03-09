@@ -195,6 +195,19 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    async fn test_db() -> Arc<Database> {
+        dotenvy::dotenv().ok();
+        Arc::new(
+            Database::new(&std::env::var("DATABASE_URL").unwrap())
+                .await
+                .unwrap(),
+        )
+    }
+
+    fn admin_token() -> String {
+        format!("Bearer {}", std::env::var("ADMIN_TOKEN").unwrap())
+    }
+
     fn test_public_app(db: Arc<Database>) -> Router {
         let state = AppState::new(db);
         Router::new()
@@ -209,20 +222,9 @@ mod tests {
     // T011/T012 — GET /api/seasons, GET /api/seasons/{id}/subjects
     #[tokio::test]
     async fn test_list_seasons_returns_200() {
-        dotenvy::dotenv().ok();
-        let db = Arc::new(
-            Database::new(&std::env::var("DATABASE_URL").unwrap())
-                .await
-                .unwrap(),
-        );
-        let app = test_public_app(db);
+        let app = test_public_app(test_db().await);
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/seasons")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/api/seasons").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -230,13 +232,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_season_subjects_404_for_unknown() {
-        dotenvy::dotenv().ok();
-        let db = Arc::new(
-            Database::new(&std::env::var("DATABASE_URL").unwrap())
-                .await
-                .unwrap(),
-        );
-        let app = test_public_app(db);
+        let app = test_public_app(test_db().await);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -252,21 +248,13 @@ mod tests {
     // T021/T022 — POST /admin/seasons
     #[tokio::test]
     async fn test_create_season_invalid_month_returns_400() {
-        dotenvy::dotenv().ok();
-        dotenvy::dotenv().ok();
-        let db = Arc::new(
-            Database::new(&std::env::var("DATABASE_URL").unwrap())
-                .await
-                .unwrap(),
-        );
-        let state = AppState::new(db.clone());
-        let app = admin_router(state);
+        let app = admin_router(AppState::new(test_db().await));
         let resp = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/admin/seasons")
-                    .header("Authorization", "Bearer testtoken")
+                    .header("Authorization", admin_token())
                     .header("Content-Type", "application/json")
                     .body(Body::from(r#"{"year":2026,"month":2}"#))
                     .unwrap(),
@@ -278,15 +266,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_season_no_token_returns_401() {
-        dotenvy::dotenv().ok();
-        dotenvy::dotenv().ok();
-        let db = Arc::new(
-            Database::new(&std::env::var("DATABASE_URL").unwrap())
-                .await
-                .unwrap(),
-        );
-        let state = AppState::new(db);
-        let app = admin_router(state);
+        let app = admin_router(AppState::new(test_db().await));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -304,15 +284,7 @@ mod tests {
     // T023/T024 — POST /admin/seasons/{id}/sync
     #[tokio::test]
     async fn test_sync_season_no_token_returns_401() {
-        dotenvy::dotenv().ok();
-        dotenvy::dotenv().ok();
-        let db = Arc::new(
-            Database::new(&std::env::var("DATABASE_URL").unwrap())
-                .await
-                .unwrap(),
-        );
-        let state = AppState::new(db);
-        let app = admin_router(state);
+        let app = admin_router(AppState::new(test_db().await));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -328,21 +300,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_season_unknown_id_returns_500() {
-        dotenvy::dotenv().ok();
-        dotenvy::dotenv().ok();
-        let db = Arc::new(
-            Database::new(&std::env::var("DATABASE_URL").unwrap())
-                .await
-                .unwrap(),
-        );
-        let state = AppState::new(db);
-        let app = admin_router(state);
+        let app = admin_router(AppState::new(test_db().await));
         let resp = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/admin/seasons/999999/sync")
-                    .header("Authorization", "Bearer testtoken")
+                    .header("Authorization", admin_token())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -351,18 +315,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // T040/T042 — GET/DELETE /admin/subjects/orphans
+    // T040 — GET /admin/subjects/orphans
     #[tokio::test]
     async fn test_list_orphans_no_token_returns_401() {
-        dotenvy::dotenv().ok();
-        dotenvy::dotenv().ok();
-        let db = Arc::new(
-            Database::new(&std::env::var("DATABASE_URL").unwrap())
-                .await
-                .unwrap(),
-        );
-        let state = AppState::new(db);
-        let app = admin_router(state);
+        let app = admin_router(AppState::new(test_db().await));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -377,20 +333,46 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_orphans_with_token_returns_200() {
-        dotenvy::dotenv().ok();
-        dotenvy::dotenv().ok();
-        let db = Arc::new(
-            Database::new(&std::env::var("DATABASE_URL").unwrap())
-                .await
-                .unwrap(),
-        );
-        let state = AppState::new(db);
-        let app = admin_router(state);
+        let app = admin_router(AppState::new(test_db().await));
         let resp = app
             .oneshot(
                 Request::builder()
                     .uri("/admin/subjects/orphans")
-                    .header("Authorization", "Bearer testtoken")
+                    .header("Authorization", admin_token())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // T042 — DELETE /admin/subjects/orphans
+    #[tokio::test]
+    async fn test_delete_orphans_no_token_returns_401() {
+        let app = admin_router(AppState::new(test_db().await));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/admin/subjects/orphans")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_delete_orphans_with_token_returns_200() {
+        let app = admin_router(AppState::new(test_db().await));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/admin/subjects/orphans")
+                    .header("Authorization", admin_token())
                     .body(Body::empty())
                     .unwrap(),
             )
