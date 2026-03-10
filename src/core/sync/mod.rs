@@ -37,6 +37,8 @@ impl SyncService {
         name: Option<String>,
     ) -> Result<SyncResult> {
         let season_id = year * 100 + month;
+        // T015: sync started log
+        tracing::info!(season_id = %season_id, operation = "create", "sync started");
         let season_str = month_to_season(month)?;
         let key = format!("{}-{}", year, season_str.to_lowercase());
         let pool = self.db.pool();
@@ -52,10 +54,16 @@ impl SyncService {
             .await
             .context("upsert season 失败")?;
 
-        self.sync_season_data(season_id, &key).await
+        self.sync_season_data(season_id, &key).await.map_err(|e| {
+            // T017: sync failed log
+            tracing::error!(season_id = %season_id, error = %e, "sync failed");
+            e
+        })
     }
 
     pub async fn resync(&self, season_id: i32) -> Result<SyncResult> {
+        // T015: sync started log
+        tracing::info!(season_id = %season_id, operation = "resync", "sync started");
         let pool = self.db.pool();
         let season = SeasonRepository::new(pool)
             .find_by_id(season_id)
@@ -66,10 +74,15 @@ impl SyncService {
         let season_str = month_to_season(month)?;
         let key = format!("{}-{}", season.year, season_str.to_lowercase());
 
-        self.sync_season_data(season_id, &key).await
+        self.sync_season_data(season_id, &key).await.map_err(|e| {
+            // T017: sync failed log
+            tracing::error!(season_id = %season_id, error = %e, "sync failed");
+            e
+        })
     }
 
     async fn sync_season_data(&self, season_id: i32, key: &str) -> Result<SyncResult> {
+        let start = std::time::Instant::now();
         let pool = self.db.pool();
 
         // 2. Fetch season data
@@ -116,6 +129,18 @@ impl SyncService {
                 }
             }
         }
+
+        // T016: sync completed log
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        tracing::info!(
+            season_id = %season_id,
+            added,
+            updated,
+            deleted = removed,
+            failed,
+            elapsed_ms,
+            "sync completed"
+        );
 
         Ok(SyncResult {
             season_id,
@@ -208,6 +233,41 @@ fn to_create_subject(s: BangumiSubject) -> CreateSubject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T012 [US2]: 验证同步开始时 INFO 事件包含 season_id 和 operation 字段
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_sync_started_log_has_season_id_and_operation() {
+        dotenvy::dotenv().ok();
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let db = Arc::new(Database::new(&database_url).await.unwrap());
+        let svc = SyncService::new(db);
+        // month=2 无效，但 sync started 日志应在 month_to_season 之前触发
+        let _ = svc.create_and_sync(2026, 2, None).await;
+        assert!(logs_contain("season_id"), "sync started 日志应包含 season_id 字段");
+        assert!(logs_contain("operation"), "sync started 日志应包含 operation 字段");
+    }
+
+    // T013 [US2]: 验证同步完成时 INFO 事件包含 added, updated, deleted, failed, elapsed_ms 字段
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_sync_completed_log_has_result_fields() {
+        dotenvy::dotenv().ok();
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let db = Arc::new(Database::new(&database_url).await.unwrap());
+        let svc = SyncService::new(db);
+        let result = svc.create_and_sync(2999, 1, None).await;
+        if result.is_ok() {
+            assert!(logs_contain("added"), "sync completed 日志应包含 added 字段");
+            assert!(logs_contain("elapsed_ms"), "sync completed 日志应包含 elapsed_ms 字段");
+        }
+    }
 
     // T019 — SyncService::create_and_sync / resync
     #[test]

@@ -51,6 +51,8 @@ pub fn create_app(db: Arc<Database>) -> Router {
                         .headers()
                         .get("x-forwarded-for")
                         .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.split(',').next())
+                        .map(|s| s.trim())
                         .unwrap_or("unknown")
                         .to_owned();
                     // T011: status_code 和 elapsed_ms 由 TraceLayer on_response 自动记录

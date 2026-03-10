@@ -1,6 +1,20 @@
 use crate::dal::dto::{CreateSubject, Subject, UpdateSubject};
 use sqlx::PgPool;
 
+fn log_db_error(operation: &'static str, table: &'static str, e: &sqlx::Error) {
+    match e {
+        sqlx::Error::RowNotFound => {
+            tracing::debug!(operation, table, error = %e, "db error");
+        }
+        sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
+            tracing::warn!(operation, table, error = %e, "db error");
+        }
+        _ => {
+            tracing::error!(operation, table, error = %e, "db error");
+        }
+    }
+}
+
 pub struct SubjectRepository<'a> {
     pool: &'a PgPool,
 }
@@ -84,7 +98,8 @@ impl<'a> SubjectRepository<'a> {
         .bind(subject.media_type)
         .bind(subject.rating)
         .fetch_one(self.pool)
-        .await?;
+        .await
+        .inspect_err(|e| log_db_error("upsert", "subjects", e))?;
 
         Ok(row)
     }
@@ -137,7 +152,8 @@ impl<'a> SubjectRepository<'a> {
             "#,
         )
         .fetch_all(self.pool)
-        .await?;
+        .await
+        .inspect_err(|e| log_db_error("find_orphans", "subjects", e))?;
 
         Ok(rows)
     }

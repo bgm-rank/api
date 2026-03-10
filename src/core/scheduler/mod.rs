@@ -71,9 +71,13 @@ impl SchedulerService {
         use tokio::time::{Duration, interval, sleep};
 
         let mut tick = interval(Duration::from_secs(4 * 3600));
+        let mut tick_count = 0u64;
 
         loop {
             tick.tick().await;
+            tick_count += 1;
+            // T023: tick start log
+            tracing::info!(tick = tick_count, event_type = "start", "scheduler tick");
 
             let today = chrono::Utc::now().date_naive();
             let (year, month) = current_quarter(today);
@@ -85,7 +89,7 @@ impl SchedulerService {
             let due_subjects = match subject_repo.find_due_for_update(current_season_id).await {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::error!(error = %e, "find_due_for_update 失败");
+                    tracing::error!(tick = tick_count, event_type = "error", error = %e, "find_due_for_update 失败");
                     continue;
                 }
             };
@@ -121,6 +125,9 @@ impl SchedulerService {
 
                 sleep(Duration::from_millis(500)).await;
             }
+
+            // T023: tick complete log
+            tracing::info!(tick = tick_count, event_type = "complete", "scheduler tick");
         }
     }
 }

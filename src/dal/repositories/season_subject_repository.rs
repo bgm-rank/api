@@ -1,6 +1,20 @@
 use crate::dal::dto::{CreateSeasonSubject, SeasonSubject, Subject};
 use sqlx::PgPool;
 
+fn log_db_error(operation: &'static str, table: &'static str, e: &sqlx::Error) {
+    match e {
+        sqlx::Error::RowNotFound => {
+            tracing::debug!(operation, table, error = %e, "db error");
+        }
+        sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
+            tracing::warn!(operation, table, error = %e, "db error");
+        }
+        _ => {
+            tracing::error!(operation, table, error = %e, "db error");
+        }
+    }
+}
+
 pub struct SeasonSubjectRepository<'a> {
     pool: &'a PgPool,
 }
@@ -66,7 +80,8 @@ impl<'a> SeasonSubjectRepository<'a> {
         let to_add: Vec<i32> = new_set.difference(&current).copied().collect();
         let to_remove: Vec<i32> = current.difference(&new_set).copied().collect();
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await
+            .inspect_err(|e| log_db_error("reconcile_begin_tx", "season_subjects", e))?;
 
         for subject_id in &to_add {
             sqlx::query(
@@ -75,7 +90,8 @@ impl<'a> SeasonSubjectRepository<'a> {
             .bind(season_id)
             .bind(subject_id)
             .execute(&mut *tx)
-            .await?;
+            .await
+            .inspect_err(|e| log_db_error("reconcile_insert", "season_subjects", e))?;
         }
 
         if !to_remove.is_empty() {
@@ -85,10 +101,12 @@ impl<'a> SeasonSubjectRepository<'a> {
             .bind(season_id)
             .bind(&to_remove)
             .execute(&mut *tx)
-            .await?;
+            .await
+            .inspect_err(|e| log_db_error("reconcile_delete", "season_subjects", e))?;
         }
 
-        tx.commit().await?;
+        tx.commit().await
+            .inspect_err(|e| log_db_error("reconcile_commit", "season_subjects", e))?;
         Ok((to_add.len(), to_remove.len()))
     }
 

@@ -1,6 +1,20 @@
 use crate::dal::dto::{CreateSeason, Season, UpdateSeason};
 use sqlx::PgPool;
 
+fn log_db_error(operation: &'static str, table: &'static str, e: &sqlx::Error) {
+    match e {
+        sqlx::Error::RowNotFound => {
+            tracing::debug!(operation, table, error = %e, "db error");
+        }
+        sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
+            tracing::warn!(operation, table, error = %e, "db error");
+        }
+        _ => {
+            tracing::error!(operation, table, error = %e, "db error");
+        }
+    }
+}
+
 pub struct SeasonRepository<'a> {
     pool: &'a PgPool,
 }
@@ -48,7 +62,8 @@ impl<'a> SeasonRepository<'a> {
         .bind(season.season)
         .bind(season.name)
         .fetch_one(self.pool)
-        .await?;
+        .await
+        .inspect_err(|e| log_db_error("upsert", "seasons", e))?;
 
         Ok(row)
     }
@@ -61,7 +76,8 @@ impl<'a> SeasonRepository<'a> {
         )
         .bind(season_id)
         .fetch_optional(self.pool)
-        .await?;
+        .await
+        .inspect_err(|e| log_db_error("find_by_id", "seasons", e))?;
 
         Ok(row)
     }
