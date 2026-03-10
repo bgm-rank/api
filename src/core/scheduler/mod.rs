@@ -99,17 +99,19 @@ impl SchedulerService {
         use crate::dal::SubjectRepository;
         use tokio::time::{Duration, Instant, sleep, sleep_until};
 
-        log::info!("调度器已启动");
+        tracing::info!("调度器已启动");
 
+        let mut tick_count: u64 = 0;
         loop {
             let now = Utc::now();
             let next = next_scheduled_instant(now);
             let cst = FixedOffset::east_opt(8 * 3600).unwrap();
-            log::info!("下次触发时间: {}", next.with_timezone(&cst));
+            tracing::info!("下次触发时间: {}", next.with_timezone(&cst));
             let wait = (next - now).to_std().unwrap_or(Duration::from_secs(0));
             sleep_until(Instant::now() + wait).await;
 
-            log::info!("调度器触发，开始本轮番剧详情更新");
+            tick_count += 1;
+            tracing::info!("调度器触发，开始本轮番剧详情更新");
 
             let today = chrono::Utc::now().date_naive();
             let (year, month) = current_quarter(today);
