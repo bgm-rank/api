@@ -5,42 +5,13 @@ mod services;
 
 use std::sync::Arc;
 
-use crate::api::endpoints::{AppState, admin_router, get_season_subjects, list_seasons};
 use crate::core::scheduler::SchedulerService;
 use crate::dal::db::Database;
-use axum::{Json, Router, extract::State, routing::get};
-use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Serialize)]
-struct HealthResponse {
-    status: String,
-    db: String,
-}
-
-async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok".to_string(),
-        db: match state.db.ping().await {
-            Ok(true) => "ok".to_string(),
-            Ok(false) => "error".to_string(),
-            Err(e) => e.to_string(),
-        },
-    })
-}
-
-fn app(db: Arc<Database>) -> Router {
-    let state = AppState::new(db);
-    let admin = admin_router(state.clone());
-    Router::new()
-        .route("/health", get(health_check))
-        .route("/api/seasons", get(list_seasons))
-        .route(
-            "/api/seasons/{season_id}/subjects",
-            get(get_season_subjects),
-        )
-        .with_state(state)
-        .merge(admin)
+// T007 [US1]: 服务启动成功时记录 INFO 事件（含 addr 和 db_status 字段）
+fn log_service_started(addr: &str) {
+    tracing::info!(addr = %addr, db_status = "connected", "service started");
 }
 
 #[tokio::main]
@@ -60,8 +31,18 @@ async fn main() {
         .expect("无法绑定端口");
 
     let database_url = std::env::var("DATABASE_URL").unwrap();
-    let db = Database::new(&database_url).await.unwrap();
+    // T008 [US1]: 数据库连接失败时记录 ERROR 事件
+    let db = match Database::new(&database_url).await {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to connect to database");
+            std::process::exit(1);
+        }
+    };
     let db = Arc::new(db);
+
+    // T007 [US1]: 数据库连接成功后记录启动日志
+    log_service_started(addr);
 
     let scheduler = SchedulerService::new(Arc::clone(&db));
     tokio::spawn(async move {
@@ -70,7 +51,7 @@ async fn main() {
         }
     });
 
-    axum::serve(listener, app(db))
+    axum::serve(listener, api::create_app(db))
         .await
         .expect("服务器运行错误");
 }
@@ -91,7 +72,7 @@ mod tests {
         let db = Database::new(&database_url).await.unwrap();
         let db = Arc::new(db);
 
-        let app = app(db);
+        let app = api::create_app(db);
 
         let request = Request::builder()
             .uri("/health")
@@ -101,5 +82,15 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // T005 [US1]: 验证服务启动时 INFO 事件包含 addr 和 db_status="connected"
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_service_startup_log_contains_addr_and_db_status() {
+        log_service_started("0.0.0.0:3000");
+        assert!(logs_contain("addr"));
+        assert!(logs_contain("db_status"));
+        assert!(logs_contain("connected"));
     }
 }
