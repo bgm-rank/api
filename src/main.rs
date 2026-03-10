@@ -10,6 +10,7 @@ use crate::core::scheduler::SchedulerService;
 use crate::dal::db::Database;
 use axum::{Json, Router, extract::State, routing::get};
 use serde::Serialize;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -46,6 +47,13 @@ fn app(db: Arc<Database>) -> Router {
 async fn main() {
     dotenvy::dotenv().ok();
 
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
     let addr = "0.0.0.0:3000";
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -58,7 +66,7 @@ async fn main() {
     let scheduler = SchedulerService::new(Arc::clone(&db));
     tokio::spawn(async move {
         if let Err(e) = scheduler.run().await {
-            log::error!("Scheduler error: {:#}", e);
+            tracing::error!(error = %e, "Scheduler error");
         }
     });
 

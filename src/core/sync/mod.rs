@@ -104,14 +104,14 @@ impl SyncService {
             match self.bangumi_client.get_subject(entry.bgm_id).await {
                 Ok(bgm_subject) => {
                     if let Err(e) = subject_repo.upsert(to_create_subject(bgm_subject)).await {
-                        log::error!("upsert subject {} 失败: {:#}", entry.bgm_id, e);
+                        tracing::error!(subject_id = entry.bgm_id, error = %e, "upsert subject 失败");
                         failed += 1;
                     } else {
                         updated += 1;
                     }
                 }
                 Err(e) => {
-                    log::error!("拉取 subject {} 失败: {:#}", entry.bgm_id, e);
+                    tracing::error!(subject_id = entry.bgm_id, error = %e, "拉取 subject 失败");
                     failed += 1;
                 }
             }

@@ -85,7 +85,7 @@ impl SchedulerService {
             let due_subjects = match subject_repo.find_due_for_update(current_season_id).await {
                 Ok(s) => s,
                 Err(e) => {
-                    log::error!("find_due_for_update 失败: {:#}", e);
+                    tracing::error!(error = %e, "find_due_for_update 失败");
                     continue;
                 }
             };
@@ -107,15 +107,15 @@ impl SchedulerService {
                             ..Default::default()
                         };
                         if let Err(e) = subject_repo.upsert(create).await {
-                            log::error!("调度器 upsert subject {} 失败: {:#}", subject_id, e);
+                            tracing::error!(subject_id, error = %e, "调度器 upsert subject 失败");
                             continue;
                         }
                         if let Err(e) = subject_repo.update_last_updated_at(subject_id).await {
-                            log::error!("update_last_updated_at {} 失败: {:#}", subject_id, e);
+                            tracing::error!(subject_id, error = %e, "update_last_updated_at 失败");
                         }
                     }
                     Err(e) => {
-                        log::error!("调度器拉取 subject {} 失败: {:#}", subject_id, e);
+                        tracing::error!(subject_id, error = %e, "调度器拉取 subject 失败");
                     }
                 }
 
