@@ -96,7 +96,18 @@ impl SeasonDataClient {
     // 获取某一季度的番剧列表，如 "2026-winter"
     pub async fn fetch_season(&self, key: &str) -> anyhow::Result<Vec<SeasonEntry>> {
         let mut all = self.fetch_all().await?;
-        Ok(all.remove(key).unwrap_or_default())
+        match all.remove(key) {
+            Some(entries) => Ok(entries),
+            None => {
+                let available_keys: Vec<&str> = all.keys().map(|k| k.as_str()).collect();
+                tracing::warn!(
+                    key,
+                    available_keys = ?available_keys,
+                    "season key not found in season-data.json"
+                );
+                Ok(vec![])
+            }
+        }
     }
 }
 

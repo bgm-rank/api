@@ -188,7 +188,7 @@ fn month_to_season(month: i32) -> Result<String> {
         1 => Ok("WINTER".to_string()),
         4 => Ok("SPRING".to_string()),
         7 => Ok("SUMMER".to_string()),
-        10 => Ok("AUTUMN".to_string()),
+        10 => Ok("FALL".to_string()),
         _ => Err(anyhow!("Invalid month: {}", month)),
     }
 }
@@ -357,8 +357,8 @@ mod tests {
     }
 
     #[test]
-    fn test_month_to_season_autumn() {
-        assert_eq!(month_to_season(10).unwrap(), "AUTUMN");
+    fn test_month_to_season_fall() {
+        assert_eq!(month_to_season(10).unwrap(), "FALL");
     }
 
     #[test]
