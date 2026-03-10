@@ -5,6 +5,7 @@ use axum::{
     middleware,
     response::IntoResponse,
 };
+use serde::Serialize;
 use std::sync::Arc;
 
 use crate::core::SyncService;
@@ -16,6 +17,23 @@ use super::schemas::{
     CreateSeasonRequest, DeleteOrphansResponse, ErrorResponse, OrphanSubjectItem,
     SyncResultResponse,
 };
+
+#[derive(Serialize)]
+pub struct HealthResponse {
+    pub status: String,
+    pub db: String,
+}
+
+pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_string(),
+        db: match state.db.ping().await {
+            Ok(true) => "ok".to_string(),
+            Ok(false) => "error".to_string(),
+            Err(e) => e.to_string(),
+        },
+    })
+}
 
 #[derive(Clone)]
 pub struct AppState {
