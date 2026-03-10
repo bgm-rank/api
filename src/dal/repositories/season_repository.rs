@@ -122,6 +122,15 @@ impl<'a> SeasonRepository<'a> {
         Ok(row)
     }
 
+    pub async fn touch_updated_at(&self, season_id: i32) -> Result<bool, sqlx::Error> {
+        let result =
+            sqlx::query("UPDATE seasons SET updated_at = CURRENT_TIMESTAMP WHERE season_id = $1")
+                .bind(season_id)
+                .execute(self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn delete(&self, season_id: i32) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             r#"
@@ -139,6 +148,40 @@ impl<'a> SeasonRepository<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T005 — touch_updated_at（Red 阶段）
+    #[sqlx::test]
+    async fn test_touch_updated_at_returns_true_when_exists(pool: PgPool) -> sqlx::Result<()> {
+        let repo = SeasonRepository::new(&pool);
+        repo.create(CreateSeason {
+            season_id: 202601,
+            year: 2026,
+            season: "WINTER".to_string(),
+            name: None,
+        })
+        .await?;
+
+        let before = repo.find_by_id(202601).await?.unwrap().updated_at;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let result = repo.touch_updated_at(202601).await?;
+        assert!(result, "should return true for existing season");
+
+        let after = repo.find_by_id(202601).await?.unwrap().updated_at;
+        assert!(after > before, "updated_at should be updated");
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_touch_updated_at_returns_false_when_not_exists(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = SeasonRepository::new(&pool);
+        let result = repo.touch_updated_at(999999).await?;
+        assert!(!result, "should return false for non-existent season");
+        Ok(())
+    }
 
     #[sqlx::test]
     async fn test_create_season(pool: PgPool) -> sqlx::Result<()> {

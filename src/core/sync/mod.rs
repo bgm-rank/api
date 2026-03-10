@@ -1,8 +1,10 @@
 use anyhow::{Context, Result, anyhow};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::dal::{CreateSeason, CreateSubject, Database};
 use crate::dal::{SeasonRepository, SeasonSubjectRepository, SubjectRepository};
+use crate::services::bangumi::schemas::{Collection, Episode, InfoboxItem};
 use crate::services::bangumi::{BangumiClient, Subject as BangumiSubject};
 use crate::services::season_data::{MediaType, Rating, SeasonDataClient};
 
@@ -215,6 +217,57 @@ fn rating_to_str(r: &Rating) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
+fn normalize_rank(rank: Option<i32>) -> Option<i32> {
+    rank.map(|r| if r == 0 { 999999 } else { r })
+}
+
+#[allow(dead_code)]
+fn calculate_exact_score(count: &HashMap<String, i32>) -> Option<f64> {
+    let total: i32 = count.values().sum();
+    if total == 0 {
+        return None;
+    }
+    let weighted_sum: f64 = count
+        .iter()
+        .filter_map(|(k, &v)| k.parse::<f64>().ok().map(|rating| rating * v as f64))
+        .sum();
+    Some(weighted_sum / total as f64)
+}
+
+#[allow(dead_code)]
+fn extract_air_weekday(infobox: &[InfoboxItem]) -> Option<String> {
+    infobox
+        .iter()
+        .find(|item| item.key.as_deref() == Some("放送星期"))
+        .and_then(|item| {
+            item.value
+                .as_ref()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        })
+}
+
+#[allow(dead_code)]
+fn calculate_drop_rate(c: &Collection) -> Option<f64> {
+    let total = c.wish + c.collect + c.doing + c.on_hold + c.dropped;
+    if total == 0 {
+        return None;
+    }
+    Some(c.dropped as f64 / total as f64)
+}
+
+#[allow(dead_code)]
+pub(crate) fn dedup_preserving_order(tags: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    tags.into_iter().filter(|t| seen.insert(t.clone())).collect()
+}
+
+// 签名占位，完整实现在 Phase 5 (T028) 配合测试红灯写入
+#[allow(dead_code)]
+pub(crate) fn calculate_average_comment(_episodes: &[Episode]) -> Option<f64> {
+    None
+}
+
 fn to_create_subject(s: BangumiSubject) -> CreateSubject {
     CreateSubject {
         id: s.id,
@@ -233,6 +286,101 @@ fn to_create_subject(s: BangumiSubject) -> CreateSubject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::bangumi::schemas::{Collection, Episode, InfoboxItem};
+    use std::collections::HashMap;
+
+    // T008 — normalize_rank
+    #[test]
+    fn test_normalize_rank_zero_becomes_999999() {
+        assert_eq!(normalize_rank(Some(0)), Some(999999));
+    }
+
+    #[test]
+    fn test_normalize_rank_nonzero_unchanged() {
+        assert_eq!(normalize_rank(Some(42)), Some(42));
+    }
+
+    #[test]
+    fn test_normalize_rank_none_stays_none() {
+        assert_eq!(normalize_rank(None), None);
+    }
+
+    // T008 — calculate_exact_score
+    #[test]
+    fn test_calculate_exact_score_weighted_average() {
+        let mut count = HashMap::new();
+        count.insert("1".to_string(), 1);
+        count.insert("10".to_string(), 1);
+        let score = calculate_exact_score(&count).unwrap();
+        assert!((score - 5.5).abs() < 0.0001, "expected 5.5, got {score}");
+    }
+
+    #[test]
+    fn test_calculate_exact_score_empty_returns_none() {
+        let count: HashMap<String, i32> = HashMap::new();
+        assert_eq!(calculate_exact_score(&count), None);
+    }
+
+    // T008 — extract_air_weekday
+    #[test]
+    fn test_extract_air_weekday_found() {
+        let infobox = vec![InfoboxItem {
+            key: Some("放送星期".to_string()),
+            value: Some(serde_json::Value::String("星期五".to_string())),
+        }];
+        assert_eq!(
+            extract_air_weekday(&infobox),
+            Some("星期五".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_air_weekday_not_found() {
+        let infobox: Vec<InfoboxItem> = vec![];
+        assert_eq!(extract_air_weekday(&infobox), None);
+    }
+
+    // T008 — calculate_drop_rate
+    #[test]
+    fn test_calculate_drop_rate_normal() {
+        let c = Collection {
+            wish: 10,
+            collect: 60,
+            doing: 10,
+            on_hold: 10,
+            dropped: 10,
+        };
+        let rate = calculate_drop_rate(&c).unwrap();
+        assert!((rate - 0.1).abs() < 0.0001, "expected 0.1, got {rate}");
+    }
+
+    #[test]
+    fn test_calculate_drop_rate_zero_total_returns_none() {
+        let c = Collection {
+            wish: 0,
+            collect: 0,
+            doing: 0,
+            on_hold: 0,
+            dropped: 0,
+        };
+        assert_eq!(calculate_drop_rate(&c), None);
+    }
+
+    // T008 — dedup_preserving_order
+    #[test]
+    fn test_dedup_preserving_order_removes_duplicates() {
+        let input = vec!["TV".to_string(), "TV".to_string(), "动作".to_string()];
+        assert_eq!(
+            dedup_preserving_order(input),
+            vec!["TV".to_string(), "动作".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_dedup_preserving_order_empty() {
+        let input: Vec<String> = vec![];
+        assert_eq!(dedup_preserving_order(input), Vec::<String>::new());
+    }
 
     // T012 [US2]: 验证同步开始时 INFO 事件包含 season_id 和 operation 字段
     #[tracing_test::traced_test]
