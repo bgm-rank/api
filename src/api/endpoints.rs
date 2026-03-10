@@ -242,7 +242,12 @@ mod tests {
     async fn test_list_seasons_returns_200() {
         let app = test_public_app(test_db().await);
         let resp = app
-            .oneshot(Request::builder().uri("/api/seasons").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/seasons")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

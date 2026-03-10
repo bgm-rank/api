@@ -80,7 +80,10 @@ impl<'a> SeasonSubjectRepository<'a> {
         let to_add: Vec<i32> = new_set.difference(&current).copied().collect();
         let to_remove: Vec<i32> = current.difference(&new_set).copied().collect();
 
-        let mut tx = self.pool.begin().await
+        let mut tx = self
+            .pool
+            .begin()
+            .await
             .inspect_err(|e| log_db_error("reconcile_begin_tx", "season_subjects", e))?;
 
         for subject_id in &to_add {
@@ -105,7 +108,8 @@ impl<'a> SeasonSubjectRepository<'a> {
             .inspect_err(|e| log_db_error("reconcile_delete", "season_subjects", e))?;
         }
 
-        tx.commit().await
+        tx.commit()
+            .await
             .inspect_err(|e| log_db_error("reconcile_commit", "season_subjects", e))?;
         Ok((to_add.len(), to_remove.len()))
     }

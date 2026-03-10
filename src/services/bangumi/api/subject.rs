@@ -80,7 +80,10 @@ mod tests {
     async fn test_api_call_failure_logs_warn_with_subject_id_and_error() {
         let client = BangumiClient::new();
         let _ = client.get_subject(999999999).await;
-        assert!(logs_contain("subject_id"), "API 失败日志应包含 subject_id 字段");
+        assert!(
+            logs_contain("subject_id"),
+            "API 失败日志应包含 subject_id 字段"
+        );
         assert!(
             logs_contain("bangumi api call failed"),
             "应记录 bangumi api call failed WARN 日志"

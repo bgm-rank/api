@@ -123,7 +123,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(logs_contain("missing_header"), "应包含 missing_header reason");
+        assert!(
+            logs_contain("missing_header"),
+            "应包含 missing_header reason"
+        );
 
         // 测试 invalid_token 场景
         let app = test_app();

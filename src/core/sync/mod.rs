@@ -247,8 +247,14 @@ mod tests {
         let svc = SyncService::new(db);
         // month=2 无效，但 sync started 日志应在 month_to_season 之前触发
         let _ = svc.create_and_sync(2026, 2, None).await;
-        assert!(logs_contain("season_id"), "sync started 日志应包含 season_id 字段");
-        assert!(logs_contain("operation"), "sync started 日志应包含 operation 字段");
+        assert!(
+            logs_contain("season_id"),
+            "sync started 日志应包含 season_id 字段"
+        );
+        assert!(
+            logs_contain("operation"),
+            "sync started 日志应包含 operation 字段"
+        );
     }
 
     // T013 [US2]: 验证同步完成时 INFO 事件包含 added, updated, deleted, failed, elapsed_ms 字段
@@ -264,8 +270,14 @@ mod tests {
         let svc = SyncService::new(db);
         let result = svc.create_and_sync(2999, 1, None).await;
         if result.is_ok() {
-            assert!(logs_contain("added"), "sync completed 日志应包含 added 字段");
-            assert!(logs_contain("elapsed_ms"), "sync completed 日志应包含 elapsed_ms 字段");
+            assert!(
+                logs_contain("added"),
+                "sync completed 日志应包含 added 字段"
+            );
+            assert!(
+                logs_contain("elapsed_ms"),
+                "sync completed 日志应包含 elapsed_ms 字段"
+            );
         }
     }
 
