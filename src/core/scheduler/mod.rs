@@ -1,9 +1,38 @@
 use anyhow::Result;
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveTime, TimeZone, Utc};
 use std::sync::Arc;
 
 use crate::dal::Database;
 use crate::services::bangumi::BangumiClient;
+
+// ── Scheduler timing ──────────────────────────────────────────────────────────
+
+const SCHEDULE_HOURS: &[u32] = &[0, 4, 8, 12, 16, 20];
+
+/// 计算下一个 UTC+8 整点（0/4/8/12/16/20 时），严格大于 `now`
+pub fn next_scheduled_instant(now: DateTime<Utc>) -> DateTime<Utc> {
+    let cst = FixedOffset::east_opt(8 * 3600).unwrap();
+    let now_cst = now.with_timezone(&cst);
+    let today = now_cst.date_naive();
+
+    // 找当日下一个严格大于 now 的整点
+    for &h in SCHEDULE_HOURS {
+        let candidate_time = NaiveTime::from_hms_opt(h, 0, 0).unwrap();
+        let candidate = cst
+            .from_local_datetime(&today.and_time(candidate_time))
+            .unwrap();
+        if candidate > now {
+            return candidate.to_utc();
+        }
+    }
+
+    // 全部整点已过，返回次日 00:00 CST
+    let tomorrow = today.succ_opt().unwrap();
+    let midnight = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+    cst.from_local_datetime(&tomorrow.and_time(midnight))
+        .unwrap()
+        .to_utc()
+}
 
 // ── Pure functions ─────────────────────────────────────────────────────────────
 
@@ -68,12 +97,19 @@ impl SchedulerService {
 
     pub async fn run(self) -> Result<()> {
         use crate::dal::SubjectRepository;
-        use tokio::time::{Duration, interval, sleep};
+        use tokio::time::{Duration, Instant, sleep, sleep_until};
 
-        let mut tick = interval(Duration::from_secs(4 * 3600));
+        log::info!("调度器已启动");
 
         loop {
-            tick.tick().await;
+            let now = Utc::now();
+            let next = next_scheduled_instant(now);
+            let cst = FixedOffset::east_opt(8 * 3600).unwrap();
+            log::info!("下次触发时间: {}", next.with_timezone(&cst));
+            let wait = (next - now).to_std().unwrap_or(Duration::from_secs(0));
+            sleep_until(Instant::now() + wait).await;
+
+            log::info!("调度器触发，开始本轮番剧详情更新");
 
             let today = chrono::Utc::now().date_naive();
             let (year, month) = current_quarter(today);
@@ -128,7 +164,7 @@ impl SchedulerService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
+    use chrono::{FixedOffset, TimeZone, Utc};
 
     // T030 🔴 → T031 🟢
 
@@ -198,5 +234,65 @@ mod tests {
         let now = Utc::now();
         let fresh = now - chrono::Duration::days(1);
         assert!(!is_due(5, Some(&fresh), now));
+    }
+
+    // T002-T007: next_scheduled_instant 测试（Red 阶段）
+
+    fn cst(h: u32, m: u32, s: u32) -> DateTime<Utc> {
+        let cst = FixedOffset::east_opt(8 * 3600).unwrap();
+        cst.with_ymd_and_hms(2026, 3, 10, h, m, s).unwrap().to_utc()
+    }
+
+    fn cst_next_day(h: u32, m: u32, s: u32) -> DateTime<Utc> {
+        let cst = FixedOffset::east_opt(8 * 3600).unwrap();
+        cst.with_ymd_and_hms(2026, 3, 11, h, m, s).unwrap().to_utc()
+    }
+
+    #[test]
+    fn test_next_scheduled_instant_after_midnight() {
+        // 00:01 CST → 04:00 CST 同日
+        let now = cst(0, 1, 0);
+        let expected = cst(4, 0, 0);
+        assert_eq!(next_scheduled_instant(now), expected);
+    }
+
+    #[test]
+    fn test_next_scheduled_instant_at_noon() {
+        // 12:01 CST → 16:00 CST 同日
+        let now = cst(12, 1, 0);
+        let expected = cst(16, 0, 0);
+        assert_eq!(next_scheduled_instant(now), expected);
+    }
+
+    #[test]
+    fn test_next_scheduled_instant_before_midnight() {
+        // 23:50 CST → 次日 00:00 CST
+        let now = cst(23, 50, 0);
+        let expected = cst_next_day(0, 0, 0);
+        assert_eq!(next_scheduled_instant(now), expected);
+    }
+
+    #[test]
+    fn test_next_scheduled_instant_at_exact_hour() {
+        // 08:00:00 CST 恰好整点 → 12:00 CST（不含当前整点）
+        let now = cst(8, 0, 0);
+        let expected = cst(12, 0, 0);
+        assert_eq!(next_scheduled_instant(now), expected);
+    }
+
+    #[test]
+    fn test_next_scheduled_instant_at_last_slot() {
+        // 20:00:00 CST 最后整点 → 次日 00:00 CST
+        let now = cst(20, 0, 0);
+        let expected = cst_next_day(0, 0, 0);
+        assert_eq!(next_scheduled_instant(now), expected);
+    }
+
+    #[test]
+    fn test_next_scheduled_instant_just_before_slot() {
+        // 03:59:59 CST → 04:00 CST 同日
+        let now = cst(3, 59, 59);
+        let expected = cst(4, 0, 0);
+        assert_eq!(next_scheduled_instant(now), expected);
     }
 }
