@@ -52,17 +52,17 @@ impl<'a> SubjectRepository<'a> {
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (id) DO UPDATE SET
-                name = COALESCE(EXCLUDED.name, subjects.name),
-                name_cn = COALESCE(EXCLUDED.name_cn, subjects.name_cn),
-                images_grid = COALESCE(EXCLUDED.images_grid, subjects.images_grid),
-                images_large = COALESCE(EXCLUDED.images_large, subjects.images_large),
-                rank = COALESCE(EXCLUDED.rank, subjects.rank),
-                score = COALESCE(EXCLUDED.score, subjects.score),
-                collection_total = COALESCE(EXCLUDED.collection_total, subjects.collection_total),
-                average_comment = COALESCE(EXCLUDED.average_comment, subjects.average_comment),
-                drop_rate = COALESCE(EXCLUDED.drop_rate, subjects.drop_rate),
-                air_weekday = COALESCE(EXCLUDED.air_weekday, subjects.air_weekday),
-                meta_tags = CASE WHEN array_length(EXCLUDED.meta_tags, 1) > 0 THEN EXCLUDED.meta_tags ELSE subjects.meta_tags END,
+                name = EXCLUDED.name,
+                name_cn = EXCLUDED.name_cn,
+                images_grid = EXCLUDED.images_grid,
+                images_large = EXCLUDED.images_large,
+                rank = EXCLUDED.rank,
+                score = EXCLUDED.score,
+                collection_total = EXCLUDED.collection_total,
+                average_comment = EXCLUDED.average_comment,
+                drop_rate = EXCLUDED.drop_rate,
+                air_weekday = EXCLUDED.air_weekday,
+                meta_tags = CASE WHEN cardinality(EXCLUDED.meta_tags) > 0 THEN EXCLUDED.meta_tags ELSE subjects.meta_tags END,
                 media_type = COALESCE(EXCLUDED.media_type, subjects.media_type),
                 rating = COALESCE(EXCLUDED.rating, subjects.rating),
                 updated_at = CURRENT_TIMESTAMP
@@ -207,9 +207,7 @@ impl<'a> SubjectRepository<'a> {
                 air_weekday = COALESCE($11, air_weekday),
                 meta_tags = COALESCE($12, meta_tags)
             WHERE id = $1
-            RETURNING id, name, name_cn, images_grid, images_large,
-                rank, score, collection_total, average_comment,
-                drop_rate, air_weekday, meta_tags, updated_at
+            RETURNING *
             "#,
         )
         .bind(subject_id)
