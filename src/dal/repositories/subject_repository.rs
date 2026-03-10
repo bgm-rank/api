@@ -695,6 +695,29 @@ mod tests {
         Ok(())
     }
 
+    // T001 — score FLOAT8 精度往返测试
+    #[sqlx::test]
+    async fn test_score_float_precision_survives_roundtrip(pool: PgPool) -> sqlx::Result<()> {
+        let repo = SubjectRepository::new(&pool);
+
+        let score = 8.123456f64;
+        repo.create(CreateSubject {
+            id: 99901,
+            score: Some(score),
+            ..Default::default()
+        })
+        .await?;
+
+        let subject = repo.find_by_id(99901).await?.unwrap();
+        let roundtripped = subject.score.expect("score should be set");
+        assert!(
+            (roundtripped - score).abs() < 0.0001,
+            "Expected score ≈ {score}, got {roundtripped}"
+        );
+
+        Ok(())
+    }
+
     #[sqlx::test]
     async fn test_delete_subject(pool: PgPool) -> sqlx::Result<()> {
         let repo = SubjectRepository::new(&pool);
