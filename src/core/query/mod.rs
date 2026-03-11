@@ -23,6 +23,7 @@ impl QueryService {
                 year: s.year,
                 season: s.season,
                 name: s.name,
+                updated_at: s.updated_at,
             })
             .collect();
         Ok(result)
@@ -188,6 +189,30 @@ mod tests {
         let svc = QueryService::new(db);
         let items = svc.get_season_subjects(202601).await.unwrap().unwrap();
         assert_eq!(items[0].rank, Some(999999));
+        Ok(())
+    }
+
+    // T032 — list_seasons 包含 updated_at 字段
+    #[sqlx::test]
+    async fn test_list_seasons_includes_updated_at(pool: PgPool) -> sqlx::Result<()> {
+        let db = Arc::new(Database::from_pool(pool.clone()));
+        SeasonRepository::new(&pool)
+            .create(CreateSeason {
+                season_id: 202601,
+                year: 2026,
+                season: "WINTER".to_string(),
+                name: None,
+            })
+            .await?;
+        let svc = QueryService::new(db);
+        let seasons = svc.list_seasons().await.unwrap();
+        assert_eq!(seasons.len(), 1);
+        // updated_at 非默认零值，应为合理时间（> 2020-01-01）
+        let epoch = chrono::NaiveDate::from_ymd_opt(2020, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        assert!(seasons[0].updated_at > epoch, "updated_at should be a recent timestamp");
         Ok(())
     }
 

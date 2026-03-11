@@ -18,6 +18,7 @@ pub struct PublicSeasonResponse {
     pub year: i32,
     pub season: String,
     pub name: Option<String>,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 #[derive(Serialize)]

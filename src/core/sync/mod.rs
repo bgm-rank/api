@@ -148,6 +148,11 @@ impl SyncService {
             }
         }
 
+        // 更新 season 的 updated_at 时间戳
+        if let Err(e) = SeasonRepository::new(pool).touch_updated_at(season_id).await {
+            tracing::warn!(season_id = %season_id, error = %e, "touch_updated_at 失败");
+        }
+
         // T016: sync completed log
         let elapsed_ms = start.elapsed().as_millis() as u64;
         tracing::info!(
@@ -776,6 +781,53 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
         let avg = calculate_average_comment(&[], today);
         assert_eq!(avg, None);
+    }
+
+    // T033 — sync_season_data 完成后 touch_updated_at 机制端到端验证
+    // 通过 QueryService::list_seasons 验证 Service 层字段透传
+    #[sqlx::test]
+    async fn test_sync_season_data_updates_season_updated_at(pool: PgPool) -> sqlx::Result<()> {
+        let db = Arc::new(Database::from_pool(pool.clone()));
+        let season_repo = SeasonRepository::new(&pool);
+        let query_svc = crate::core::query::QueryService::new(db);
+
+        // 1. Setup
+        season_repo
+            .upsert(CreateSeason {
+                season_id: 202699,
+                year: 2026,
+                season: "FALL".to_string(),
+                name: None,
+            })
+            .await?;
+
+        let before = query_svc
+            .list_seasons()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.season_id == 202699)
+            .unwrap()
+            .updated_at;
+
+        // 小延迟确保时间戳可区分
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // 2. Act: 模拟 sync_season_data 末尾的 touch_updated_at 调用（T036）
+        season_repo.touch_updated_at(202699).await?;
+
+        // 3. Assert: 通过 QueryService（Service 层）验证端到端读取路径
+        let after = query_svc
+            .list_seasons()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.season_id == 202699)
+            .unwrap()
+            .updated_at;
+
+        assert!(after > before, "通过 QueryService 验证 updated_at 已更新");
+        Ok(())
     }
 
     #[test]

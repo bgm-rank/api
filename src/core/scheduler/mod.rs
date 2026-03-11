@@ -164,6 +164,14 @@ impl SchedulerService {
                 sleep(Duration::from_millis(500)).await;
             }
 
+            // 更新当前季度的 updated_at 时间戳
+            if let Err(e) = crate::dal::SeasonRepository::new(pool)
+                .touch_updated_at(current_season_id)
+                .await
+            {
+                tracing::warn!(current_season_id, error = %e, "调度器 touch_updated_at 失败");
+            }
+
             // T023: tick complete log
             tracing::info!(tick = tick_count, event_type = "complete", "scheduler tick");
         }
