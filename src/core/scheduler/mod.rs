@@ -128,22 +128,26 @@ impl SchedulerService {
                 }
             };
 
+            let today = chrono::Utc::now().date_naive();
+
             for (subject_id, _, _) in due_subjects {
+                let avg_comment = match self
+                    .bangumi_client
+                    .get_episodes(subject_id, 0, 100, 0)
+                    .await
+                {
+                    Ok(paged) => {
+                        crate::core::sync::calculate_average_comment(&paged.data, today)
+                    }
+                    Err(e) => {
+                        tracing::warn!(subject_id, error = %e, "调度器拉取 episodes 失败，降级为 None");
+                        None
+                    }
+                };
+
                 match self.bangumi_client.get_subject(subject_id).await {
                     Ok(bgm_subject) => {
-                        use crate::dal::CreateSubject;
-                        let create = CreateSubject {
-                            id: bgm_subject.id,
-                            name: bgm_subject.name,
-                            name_cn: bgm_subject.name_cn,
-                            images_grid: bgm_subject.images.as_ref().and_then(|i| i.grid.clone()),
-                            images_large: bgm_subject.images.and_then(|i| i.large),
-                            rank: bgm_subject.rating.as_ref().and_then(|r| r.rank),
-                            score: bgm_subject.rating.and_then(|r| r.score),
-                            collection_total: bgm_subject.collection.map(|c| c.collect),
-                            meta_tags: bgm_subject.meta_tags.unwrap_or_default(),
-                            ..Default::default()
-                        };
+                        let create = crate::core::sync::to_create_subject(bgm_subject, avg_comment);
                         if let Err(e) = subject_repo.upsert(create).await {
                             tracing::error!(subject_id, error = %e, "调度器 upsert subject 失败");
                             continue;

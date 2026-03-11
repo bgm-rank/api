@@ -114,11 +114,27 @@ impl SyncService {
         // 5. Fetch Bangumi details per subject
         let mut updated = 0usize;
         let mut failed = 0usize;
+        let today = chrono::Utc::now().date_naive();
 
         for entry in &entries {
+            let avg_comment = match self
+                .bangumi_client
+                .get_episodes(entry.bgm_id, 0, 100, 0)
+                .await
+            {
+                Ok(paged) => calculate_average_comment(&paged.data, today),
+                Err(e) => {
+                    tracing::warn!(subject_id = entry.bgm_id, error = %e, "拉取 episodes 失败，降级为 None");
+                    None
+                }
+            };
+
             match self.bangumi_client.get_subject(entry.bgm_id).await {
                 Ok(bgm_subject) => {
-                    if let Err(e) = subject_repo.upsert(to_create_subject(bgm_subject, None)).await {
+                    if let Err(e) = subject_repo
+                        .upsert(to_create_subject(bgm_subject, avg_comment))
+                        .await
+                    {
                         tracing::error!(subject_id = entry.bgm_id, error = %e, "upsert subject 失败");
                         failed += 1;
                     } else {
@@ -276,13 +292,31 @@ pub(crate) fn dedup_preserving_order(tags: Vec<String>) -> Vec<String> {
     tags.into_iter().filter(|t| seen.insert(t.clone())).collect()
 }
 
-// 签名占位，完整实现在 Phase 5 (T028) 配合测试红灯写入
-#[allow(dead_code)]
-pub(crate) fn calculate_average_comment(_episodes: &[Episode]) -> Option<f64> {
-    None
+pub(crate) fn calculate_average_comment(
+    episodes: &[Episode],
+    today: chrono::NaiveDate,
+) -> Option<f64> {
+    let aired: Vec<_> = episodes
+        .iter()
+        .filter(|e| {
+            e._type == 0
+                && e.airdate
+                    .as_deref()
+                    .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                    .map(|d| d <= today)
+                    .unwrap_or(false)
+        })
+        .collect();
+
+    if aired.is_empty() {
+        return None;
+    }
+
+    let total: i32 = aired.iter().map(|e| e.comment.unwrap_or(0)).sum();
+    Some(total as f64 / aired.len() as f64)
 }
 
-fn to_create_subject(s: BangumiSubject, avg_comment: Option<f64>) -> CreateSubject {
+pub(crate) fn to_create_subject(s: BangumiSubject, avg_comment: Option<f64>) -> CreateSubject {
     let rank = normalize_rank(s.rating.as_ref().and_then(|r| r.rank));
     let score = s
         .rating
@@ -592,6 +626,156 @@ mod tests {
         let result = svc.delete_season(999989).await;
         assert!(result.is_ok());
         assert!(!result.unwrap(), "should return false for non-existent season");
+    }
+
+    // T025 — to_create_subject 字段测试（air_weekday / drop_rate / avg_comment）
+
+    fn make_subject_with_infobox(
+        infobox: Option<Vec<InfoboxItem>>,
+        collection: Option<Collection>,
+    ) -> BangumiSubject {
+        BangumiSubject {
+            id: 1,
+            _type: 2,
+            name: None,
+            name_cn: None,
+            summary: None,
+            series: None,
+            nsfw: None,
+            locked: None,
+            date: None,
+            platform: None,
+            images: None,
+            infobox,
+            volumes: None,
+            eps: None,
+            total_episodes: None,
+            rating: None,
+            collection,
+            meta_tags: None,
+            tags: None,
+        }
+    }
+
+    #[test]
+    fn test_to_create_subject_air_weekday_extracted_from_infobox() {
+        let s = make_subject_with_infobox(
+            Some(vec![InfoboxItem {
+                key: Some("放送星期".to_string()),
+                value: Some(serde_json::Value::String("星期五".to_string())),
+            }]),
+            None,
+        );
+        let create = to_create_subject(s, None);
+        assert_eq!(create.air_weekday, Some("星期五".to_string()));
+    }
+
+    #[test]
+    fn test_to_create_subject_air_weekday_none_when_missing() {
+        let s = make_subject_with_infobox(Some(vec![]), None);
+        let create = to_create_subject(s, None);
+        assert_eq!(create.air_weekday, None);
+    }
+
+    #[test]
+    fn test_to_create_subject_drop_rate_calculated() {
+        let s = make_subject_with_infobox(
+            None,
+            Some(Collection {
+                wish: 10,
+                collect: 60,
+                doing: 10,
+                on_hold: 10,
+                dropped: 10,
+            }),
+        );
+        let create = to_create_subject(s, None);
+        let rate = create.drop_rate.unwrap();
+        assert!((rate - 0.1).abs() < 0.0001, "expected 0.1, got {rate}");
+    }
+
+    #[test]
+    fn test_to_create_subject_drop_rate_none_when_zero_total() {
+        let s = make_subject_with_infobox(
+            None,
+            Some(Collection {
+                wish: 0,
+                collect: 0,
+                doing: 0,
+                on_hold: 0,
+                dropped: 0,
+            }),
+        );
+        let create = to_create_subject(s, None);
+        assert_eq!(create.drop_rate, None);
+    }
+
+    #[test]
+    fn test_to_create_subject_avg_comment_passed_through() {
+        let s = make_subject_with_infobox(None, None);
+        let create = to_create_subject(s, Some(3.5));
+        assert_eq!(create.average_comment, Some(3.5));
+    }
+
+    // T026 — calculate_average_comment 测试
+
+    fn make_episode(id: i32, ep_type: i32, airdate: &str, comment: Option<i32>) -> Episode {
+        Episode {
+            id,
+            _type: ep_type,
+            name: None,
+            name_cn: None,
+            sort: None,
+            ep: None,
+            airdate: Some(airdate.to_string()),
+            comment,
+            duration: None,
+            desc: None,
+            disc: None,
+            duration_seconds: None,
+            subject_id: None,
+        }
+    }
+
+    #[test]
+    fn test_calculate_average_comment_aired_only() {
+        use chrono::NaiveDate;
+        let today = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
+        let episodes = vec![
+            make_episode(1, 0, "2026-01-01", Some(10)),
+            make_episode(2, 0, "2099-01-01", Some(5)),
+        ];
+        let avg = calculate_average_comment(&episodes, today);
+        assert_eq!(avg, Some(10.0));
+    }
+
+    #[test]
+    fn test_calculate_average_comment_all_unaired_returns_none() {
+        use chrono::NaiveDate;
+        let today = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
+        let episodes = vec![make_episode(1, 0, "2099-01-01", Some(10))];
+        let avg = calculate_average_comment(&episodes, today);
+        assert_eq!(avg, None);
+    }
+
+    #[test]
+    fn test_calculate_average_comment_skip_non_main_episodes() {
+        use chrono::NaiveDate;
+        let today = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
+        let episodes = vec![
+            make_episode(1, 0, "2026-01-01", Some(10)), // main, aired
+            make_episode(2, 1, "2026-01-08", Some(100)), // special, should be skipped
+        ];
+        let avg = calculate_average_comment(&episodes, today);
+        assert_eq!(avg, Some(10.0));
+    }
+
+    #[test]
+    fn test_calculate_average_comment_empty_returns_none() {
+        use chrono::NaiveDate;
+        let today = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
+        let avg = calculate_average_comment(&[], today);
+        assert_eq!(avg, None);
     }
 
     #[test]

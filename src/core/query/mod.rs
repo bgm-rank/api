@@ -191,6 +191,100 @@ mod tests {
         Ok(())
     }
 
+    // T027 — query_service 新字段测试（air_weekday / drop_rate / average_comment）
+
+    #[sqlx::test]
+    async fn test_query_service_air_weekday_returned(pool: PgPool) -> sqlx::Result<()> {
+        let db = Arc::new(Database::from_pool(pool.clone()));
+        SeasonRepository::new(&pool)
+            .create(CreateSeason {
+                season_id: 202601,
+                year: 2026,
+                season: "WINTER".to_string(),
+                name: None,
+            })
+            .await?;
+        SubjectRepository::new(&pool)
+            .create(CreateSubject {
+                id: 201,
+                air_weekday: Some("星期五".to_string()),
+                ..Default::default()
+            })
+            .await?;
+        SeasonSubjectRepository::new(&pool)
+            .create(CreateSeasonSubject {
+                season_id: 202601,
+                subject_id: 201,
+            })
+            .await?;
+        let svc = QueryService::new(db);
+        let items = svc.get_season_subjects(202601).await.unwrap().unwrap();
+        assert_eq!(items[0].air_weekday, Some("星期五".to_string()));
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_query_service_drop_rate_returned(pool: PgPool) -> sqlx::Result<()> {
+        let db = Arc::new(Database::from_pool(pool.clone()));
+        SeasonRepository::new(&pool)
+            .create(CreateSeason {
+                season_id: 202601,
+                year: 2026,
+                season: "WINTER".to_string(),
+                name: None,
+            })
+            .await?;
+        SubjectRepository::new(&pool)
+            .create(CreateSubject {
+                id: 202,
+                drop_rate: Some(0.1),
+                ..Default::default()
+            })
+            .await?;
+        SeasonSubjectRepository::new(&pool)
+            .create(CreateSeasonSubject {
+                season_id: 202601,
+                subject_id: 202,
+            })
+            .await?;
+        let svc = QueryService::new(db);
+        let items = svc.get_season_subjects(202601).await.unwrap().unwrap();
+        let rate = items[0].drop_rate.unwrap();
+        assert!((rate - 0.1).abs() < 0.0001, "expected 0.1, got {rate}");
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_query_service_average_comment_returned(pool: PgPool) -> sqlx::Result<()> {
+        let db = Arc::new(Database::from_pool(pool.clone()));
+        SeasonRepository::new(&pool)
+            .create(CreateSeason {
+                season_id: 202601,
+                year: 2026,
+                season: "WINTER".to_string(),
+                name: None,
+            })
+            .await?;
+        SubjectRepository::new(&pool)
+            .create(CreateSubject {
+                id: 203,
+                average_comment: Some(3.5),
+                ..Default::default()
+            })
+            .await?;
+        SeasonSubjectRepository::new(&pool)
+            .create(CreateSeasonSubject {
+                season_id: 202601,
+                subject_id: 203,
+            })
+            .await?;
+        let svc = QueryService::new(db);
+        let items = svc.get_season_subjects(202601).await.unwrap().unwrap();
+        let avg = items[0].average_comment.unwrap();
+        assert!((avg - 3.5).abs() < 0.0001, "expected 3.5, got {avg}");
+        Ok(())
+    }
+
     #[sqlx::test]
     async fn test_get_season_subjects_none_when_not_found(pool: PgPool) -> sqlx::Result<()> {
         let db = Arc::new(Database::from_pool(pool));
