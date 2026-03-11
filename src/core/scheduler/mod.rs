@@ -136,9 +136,7 @@ impl SchedulerService {
                     .get_episodes(subject_id, 0, 100, 0)
                     .await
                 {
-                    Ok(paged) => {
-                        crate::core::sync::calculate_average_comment(&paged.data, today)
-                    }
+                    Ok(paged) => crate::core::sync::calculate_average_comment(&paged.data, today),
                     Err(e) => {
                         tracing::warn!(subject_id, error = %e, "调度器拉取 episodes 失败，降级为 None");
                         None

@@ -149,7 +149,10 @@ impl SyncService {
         }
 
         // 更新 season 的 updated_at 时间戳
-        if let Err(e) = SeasonRepository::new(pool).touch_updated_at(season_id).await {
+        if let Err(e) = SeasonRepository::new(pool)
+            .touch_updated_at(season_id)
+            .await
+        {
             tracing::warn!(season_id = %season_id, error = %e, "touch_updated_at 失败");
         }
 
@@ -205,9 +208,7 @@ impl SyncService {
             .delete(season_id)
             .await
             .map_err(anyhow::Error::from)?;
-        if deleted
-            && let Err(e) = SubjectRepository::new(pool).delete_orphans().await
-        {
+        if deleted && let Err(e) = SubjectRepository::new(pool).delete_orphans().await {
             tracing::warn!(error = %e, "delete_orphans after delete_season 失败");
         }
         Ok(deleted)
@@ -252,12 +253,10 @@ fn rating_to_str(r: &Rating) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
 fn normalize_rank(rank: Option<i32>) -> Option<i32> {
     rank.map(|r| if r == 0 { 999999 } else { r })
 }
 
-#[allow(dead_code)]
 fn calculate_exact_score(count: &HashMap<String, i32>) -> Option<f64> {
     let total: i32 = count.values().sum();
     if total == 0 {
@@ -270,7 +269,6 @@ fn calculate_exact_score(count: &HashMap<String, i32>) -> Option<f64> {
     Some(weighted_sum / total as f64)
 }
 
-#[allow(dead_code)]
 fn extract_air_weekday(infobox: &[InfoboxItem]) -> Option<String> {
     infobox
         .iter()
@@ -282,7 +280,6 @@ fn extract_air_weekday(infobox: &[InfoboxItem]) -> Option<String> {
         })
 }
 
-#[allow(dead_code)]
 fn calculate_drop_rate(c: &Collection) -> Option<f64> {
     let total = c.wish + c.collect + c.doing + c.on_hold + c.dropped;
     if total == 0 {
@@ -291,10 +288,11 @@ fn calculate_drop_rate(c: &Collection) -> Option<f64> {
     Some(c.dropped as f64 / total as f64)
 }
 
-#[allow(dead_code)]
 pub(crate) fn dedup_preserving_order(tags: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
-    tags.into_iter().filter(|t| seen.insert(t.clone())).collect()
+    tags.into_iter()
+        .filter(|t| seen.insert(t.clone()))
+        .collect()
 }
 
 pub(crate) fn calculate_average_comment(
@@ -329,13 +327,11 @@ pub(crate) fn to_create_subject(s: BangumiSubject, avg_comment: Option<f64>) -> 
         .and_then(|r| r.count.as_ref())
         .and_then(calculate_exact_score);
     let drop_rate = s.collection.as_ref().and_then(calculate_drop_rate);
-    let collection_total = s.collection.as_ref().map(|c| {
-        c.wish + c.collect + c.doing + c.on_hold + c.dropped
-    });
-    let air_weekday = s
-        .infobox
-        .as_deref()
-        .and_then(extract_air_weekday);
+    let collection_total = s
+        .collection
+        .as_ref()
+        .map(|c| c.wish + c.collect + c.doing + c.on_hold + c.dropped);
+    let air_weekday = s.infobox.as_deref().and_then(extract_air_weekday);
     let meta_tags = dedup_preserving_order(s.meta_tags.unwrap_or_default());
 
     CreateSubject {
@@ -436,10 +432,7 @@ mod tests {
             key: Some("放送星期".to_string()),
             value: Some(serde_json::Value::String("星期五".to_string())),
         }];
-        assert_eq!(
-            extract_air_weekday(&infobox),
-            Some("星期五".to_string())
-        );
+        assert_eq!(extract_air_weekday(&infobox), Some("星期五".to_string()));
     }
 
     #[test]
@@ -620,7 +613,10 @@ mod tests {
         assert!(result.unwrap(), "should return true for existing season");
 
         // 验证 season 已从 DB 消失
-        let found = SeasonRepository::new(svc.db.pool()).find_by_id(202699).await.unwrap();
+        let found = SeasonRepository::new(svc.db.pool())
+            .find_by_id(202699)
+            .await
+            .unwrap();
         assert!(found.is_none(), "season should be deleted from DB");
     }
 
@@ -630,7 +626,10 @@ mod tests {
         let svc = SyncService::new(db);
         let result = svc.delete_season(999989).await;
         assert!(result.is_ok());
-        assert!(!result.unwrap(), "should return false for non-existent season");
+        assert!(
+            !result.unwrap(),
+            "should return false for non-existent season"
+        );
     }
 
     // T025 — to_create_subject 字段测试（air_weekday / drop_rate / avg_comment）
@@ -768,7 +767,7 @@ mod tests {
         use chrono::NaiveDate;
         let today = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
         let episodes = vec![
-            make_episode(1, 0, "2026-01-01", Some(10)), // main, aired
+            make_episode(1, 0, "2026-01-01", Some(10)),  // main, aired
             make_episode(2, 1, "2026-01-08", Some(100)), // special, should be skipped
         ];
         let avg = calculate_average_comment(&episodes, today);
@@ -804,18 +803,11 @@ mod tests {
             total_episodes: None,
             rating: None,
             collection: None,
-            meta_tags: Some(vec![
-                "TV".to_string(),
-                "TV".to_string(),
-                "动作".to_string(),
-            ]),
+            meta_tags: Some(vec!["TV".to_string(), "TV".to_string(), "动作".to_string()]),
             tags: None,
         };
         let create = to_create_subject(s, None);
-        assert_eq!(
-            create.meta_tags,
-            vec!["TV".to_string(), "动作".to_string()]
-        );
+        assert_eq!(create.meta_tags, vec!["TV".to_string(), "动作".to_string()]);
     }
 
     // T033 — sync_season_data 完成后 touch_updated_at 机制端到端验证

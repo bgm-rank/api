@@ -159,7 +159,10 @@ mod tests {
         let svc = QueryService::new(db);
         let items = svc.get_season_subjects(202601).await.unwrap().unwrap();
         let score = items[0].score.unwrap();
-        assert!((score - 8.1234).abs() < 0.0001, "expected 8.1234, got {score}");
+        assert!(
+            (score - 8.1234).abs() < 0.0001,
+            "expected 8.1234, got {score}"
+        );
         Ok(())
     }
 
@@ -287,7 +290,10 @@ mod tests {
             .unwrap()
             .and_hms_opt(0, 0, 0)
             .unwrap();
-        assert!(seasons[0].updated_at > epoch, "updated_at should be a recent timestamp");
+        assert!(
+            seasons[0].updated_at > epoch,
+            "updated_at should be a recent timestamp"
+        );
         Ok(())
     }
 

@@ -174,9 +174,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_touch_updated_at_returns_false_when_not_exists(
-        pool: PgPool,
-    ) -> sqlx::Result<()> {
+    async fn test_touch_updated_at_returns_false_when_not_exists(pool: PgPool) -> sqlx::Result<()> {
         let repo = SeasonRepository::new(&pool);
         let result = repo.touch_updated_at(999999).await?;
         assert!(!result, "should return false for non-existent season");
