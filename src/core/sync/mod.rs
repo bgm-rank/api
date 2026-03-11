@@ -783,6 +783,41 @@ mod tests {
         assert_eq!(avg, None);
     }
 
+    // T040 — to_create_subject 对 meta_tags 去重
+    #[test]
+    fn test_to_create_subject_deduplicates_meta_tags() {
+        let s = BangumiSubject {
+            id: 1,
+            _type: 2,
+            name: None,
+            name_cn: None,
+            summary: None,
+            series: None,
+            nsfw: None,
+            locked: None,
+            date: None,
+            platform: None,
+            images: None,
+            infobox: None,
+            volumes: None,
+            eps: None,
+            total_episodes: None,
+            rating: None,
+            collection: None,
+            meta_tags: Some(vec![
+                "TV".to_string(),
+                "TV".to_string(),
+                "动作".to_string(),
+            ]),
+            tags: None,
+        };
+        let create = to_create_subject(s, None);
+        assert_eq!(
+            create.meta_tags,
+            vec!["TV".to_string(), "动作".to_string()]
+        );
+    }
+
     // T033 — sync_season_data 完成后 touch_updated_at 机制端到端验证
     // 通过 QueryService::list_seasons 验证 Service 层字段透传
     #[sqlx::test]

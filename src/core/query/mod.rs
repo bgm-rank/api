@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::sync::Arc;
 
 use crate::api::schemas::{PublicSeasonResponse, PublicSubjectItem};
+use crate::core::sync::dedup_preserving_order;
 use crate::dal::{Database, SeasonRepository, SeasonSubjectRepository, SubjectRepository};
 
 pub struct QueryService {
@@ -73,7 +74,7 @@ impl QueryService {
                 average_comment: s.average_comment,
                 drop_rate: s.drop_rate,
                 air_weekday: s.air_weekday,
-                meta_tags: s.meta_tags,
+                meta_tags: dedup_preserving_order(s.meta_tags),
                 media_type: s.media_type,
                 rating: s.rating,
             })
@@ -189,6 +190,80 @@ mod tests {
         let svc = QueryService::new(db);
         let items = svc.get_season_subjects(202601).await.unwrap().unwrap();
         assert_eq!(items[0].rank, Some(999999));
+        Ok(())
+    }
+
+    // T039 — get_season_subjects 对 meta_tags 去重
+    #[sqlx::test]
+    async fn test_query_service_deduplicates_meta_tags(pool: PgPool) -> sqlx::Result<()> {
+        let db = Arc::new(Database::from_pool(pool.clone()));
+        SeasonRepository::new(&pool)
+            .create(CreateSeason {
+                season_id: 202601,
+                year: 2026,
+                season: "WINTER".to_string(),
+                name: None,
+            })
+            .await?;
+        SubjectRepository::new(&pool)
+            .create(CreateSubject {
+                id: 301,
+                meta_tags: vec!["TV".to_string(), "TV".to_string(), "动作".to_string()],
+                ..Default::default()
+            })
+            .await?;
+        SeasonSubjectRepository::new(&pool)
+            .create(CreateSeasonSubject {
+                season_id: 202601,
+                subject_id: 301,
+            })
+            .await?;
+        let svc = QueryService::new(db);
+        let items = svc.get_season_subjects(202601).await.unwrap().unwrap();
+        assert_eq!(
+            items[0].meta_tags,
+            vec!["TV".to_string(), "动作".to_string()],
+            "重复的 meta_tags 应被去重，保留首次出现顺序"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_query_service_dedup_preserves_order(pool: PgPool) -> sqlx::Result<()> {
+        let db = Arc::new(Database::from_pool(pool.clone()));
+        SeasonRepository::new(&pool)
+            .create(CreateSeason {
+                season_id: 202601,
+                year: 2026,
+                season: "WINTER".to_string(),
+                name: None,
+            })
+            .await?;
+        SubjectRepository::new(&pool)
+            .create(CreateSubject {
+                id: 302,
+                meta_tags: vec![
+                    "动作".to_string(),
+                    "TV".to_string(),
+                    "动作".to_string(),
+                    "剧情".to_string(),
+                ],
+                ..Default::default()
+            })
+            .await?;
+        SeasonSubjectRepository::new(&pool)
+            .create(CreateSeasonSubject {
+                season_id: 202601,
+                subject_id: 302,
+            })
+            .await?;
+        let svc = QueryService::new(db);
+        let items = svc.get_season_subjects(202601).await.unwrap().unwrap();
+        assert_eq!(
+            items[0].meta_tags,
+            vec!["动作".to_string(), "TV".to_string(), "剧情".to_string()],
+            "去重后应保留首次出现顺序"
+        );
         Ok(())
     }
 
