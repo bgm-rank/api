@@ -14,8 +14,8 @@ use crate::dal::Database;
 
 use super::middleware::require_admin_token;
 use super::schemas::{
-    CreateSeasonRequest, DeleteOrphansResponse, ErrorResponse, OrphanSubjectItem,
-    SyncResultResponse,
+    CreateSeasonRequest, DeleteOrphansResponse, DeleteSeasonResponse, ErrorResponse,
+    OrphanSubjectItem, SyncResultResponse,
 };
 
 #[derive(Serialize)]
@@ -178,6 +178,36 @@ pub async fn list_orphan_subjects(State(state): State<AppState>) -> impl IntoRes
     }
 }
 
+pub async fn delete_season(
+    State(state): State<AppState>,
+    Path(season_id): Path<i32>,
+) -> impl IntoResponse {
+    match state.sync_service.delete_season(season_id).await {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(DeleteSeasonResponse {
+                season_id,
+                deleted: true,
+            }),
+        )
+            .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Season {} not found", season_id),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn delete_orphan_subjects(State(state): State<AppState>) -> impl IntoResponse {
     match state.sync_service.delete_orphans().await {
         Ok(deleted) => Json(DeleteOrphansResponse { deleted }).into_response(),
@@ -195,6 +225,7 @@ pub fn admin_router(state: AppState) -> axum::Router {
     use axum::routing::{delete, get, post};
     axum::Router::new()
         .route("/admin/seasons", post(create_season))
+        .route("/admin/seasons/{season_id}", delete(delete_season))
         .route("/admin/seasons/{season_id}/sync", post(sync_season))
         .route("/admin/subjects/orphans", get(list_orphan_subjects))
         .route("/admin/subjects/orphans", delete(delete_orphan_subjects))
@@ -368,6 +399,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // T012 — DELETE /admin/seasons/{season_id}
+    #[tokio::test]
+    async fn test_delete_season_no_token_returns_401() {
+        let app = admin_router(AppState::new(test_db().await));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/admin/seasons/202601")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_delete_season_with_token_not_found_returns_404() {
+        let app = admin_router(AppState::new(test_db().await));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/admin/seasons/999989")
+                    .header("Authorization", admin_token())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_delete_season_with_token_existing_returns_200() {
+        let db = test_db().await;
+        // 先创建 season
+        {
+            use crate::dal::{CreateSeason, SeasonRepository};
+            let pool = db.pool();
+            SeasonRepository::new(pool)
+                .upsert(CreateSeason {
+                    season_id: 202688,
+                    year: 2026,
+                    season: "FALL".to_string(),
+                    name: None,
+                })
+                .await
+                .unwrap();
+        }
+        let app = admin_router(AppState::new(db));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/admin/seasons/202688")
+                    .header("Authorization", admin_token())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["deleted"], true);
     }
 
     // T042 — DELETE /admin/subjects/orphans

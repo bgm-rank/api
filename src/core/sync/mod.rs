@@ -177,6 +177,20 @@ impl SyncService {
             .await
             .map_err(anyhow::Error::from)
     }
+
+    pub async fn delete_season(&self, season_id: i32) -> Result<bool> {
+        let pool = self.db.pool();
+        let deleted = SeasonRepository::new(pool)
+            .delete(season_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        if deleted {
+            if let Err(e) = SubjectRepository::new(pool).delete_orphans().await {
+                tracing::warn!(error = %e, "delete_orphans after delete_season 失败");
+            }
+        }
+        Ok(deleted)
+    }
 }
 
 pub struct OrphanSubjectItem {
@@ -487,6 +501,53 @@ mod tests {
         let svc = SyncService::new(db);
         let result = svc.delete_orphans().await;
         assert!(result.is_ok());
+    }
+
+    // T011 — delete_season（Red 阶段）
+    #[tokio::test]
+    async fn test_delete_season_existing_returns_true() {
+        dotenvy::dotenv().ok();
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let db = Arc::new(Database::new(&database_url).await.unwrap());
+        let pool = db.pool();
+
+        // 创建 season 202699
+        SeasonRepository::new(pool)
+            .upsert(CreateSeason {
+                season_id: 202699,
+                year: 2026,
+                season: "FALL".to_string(),
+                name: None,
+            })
+            .await
+            .unwrap();
+
+        let svc = SyncService::new(db);
+        let result = svc.delete_season(202699).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "should return true for existing season");
+
+        // 验证 season 已从 DB 消失
+        let pool2 = svc.db.pool();
+        let found = SeasonRepository::new(pool2).find_by_id(202699).await.unwrap();
+        assert!(found.is_none(), "season should be deleted from DB");
+    }
+
+    #[tokio::test]
+    async fn test_delete_season_nonexistent_returns_false() {
+        dotenvy::dotenv().ok();
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let db = Arc::new(Database::new(&database_url).await.unwrap());
+        let svc = SyncService::new(db);
+        let result = svc.delete_season(999989).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "should return false for non-existent season");
     }
 
     #[test]

@@ -64,3 +64,9 @@ pub struct OrphanSubjectItem {
 pub struct DeleteOrphansResponse {
     pub deleted: u64,
 }
+
+#[derive(Serialize)]
+pub struct DeleteSeasonResponse {
+    pub season_id: i32,
+    pub deleted: bool,
+}
