@@ -69,6 +69,9 @@ impl QueryService {
                 rank: s.rank,
                 score: s.score,
                 collection_total: s.collection_total,
+                average_comment: s.average_comment,
+                drop_rate: s.drop_rate,
+                air_weekday: s.air_weekday,
                 meta_tags: s.meta_tags,
                 media_type: s.media_type,
                 rating: s.rating,
@@ -123,6 +126,68 @@ mod tests {
         let seasons = svc.list_seasons().await.unwrap();
         assert_eq!(seasons.len(), 1);
         assert_eq!(seasons[0].season_id, 202601);
+        Ok(())
+    }
+
+    // T019 — query_service 精确评分与 rank 测试
+    #[sqlx::test]
+    async fn test_query_service_returns_exact_score(pool: PgPool) -> sqlx::Result<()> {
+        let db = Arc::new(Database::from_pool(pool.clone()));
+        SeasonRepository::new(&pool)
+            .create(CreateSeason {
+                season_id: 202601,
+                year: 2026,
+                season: "WINTER".to_string(),
+                name: None,
+            })
+            .await?;
+        SubjectRepository::new(&pool)
+            .create(CreateSubject {
+                id: 101,
+                score: Some(8.1234),
+                ..Default::default()
+            })
+            .await?;
+        SeasonSubjectRepository::new(&pool)
+            .create(CreateSeasonSubject {
+                season_id: 202601,
+                subject_id: 101,
+            })
+            .await?;
+        let svc = QueryService::new(db);
+        let items = svc.get_season_subjects(202601).await.unwrap().unwrap();
+        let score = items[0].score.unwrap();
+        assert!((score - 8.1234).abs() < 0.0001, "expected 8.1234, got {score}");
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_query_service_rank_999999_preserved(pool: PgPool) -> sqlx::Result<()> {
+        let db = Arc::new(Database::from_pool(pool.clone()));
+        SeasonRepository::new(&pool)
+            .create(CreateSeason {
+                season_id: 202601,
+                year: 2026,
+                season: "WINTER".to_string(),
+                name: None,
+            })
+            .await?;
+        SubjectRepository::new(&pool)
+            .create(CreateSubject {
+                id: 102,
+                rank: Some(999999),
+                ..Default::default()
+            })
+            .await?;
+        SeasonSubjectRepository::new(&pool)
+            .create(CreateSeasonSubject {
+                season_id: 202601,
+                subject_id: 102,
+            })
+            .await?;
+        let svc = QueryService::new(db);
+        let items = svc.get_season_subjects(202601).await.unwrap().unwrap();
+        assert_eq!(items[0].rank, Some(999999));
         Ok(())
     }
 

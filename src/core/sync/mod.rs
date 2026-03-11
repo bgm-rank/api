@@ -118,7 +118,7 @@ impl SyncService {
         for entry in &entries {
             match self.bangumi_client.get_subject(entry.bgm_id).await {
                 Ok(bgm_subject) => {
-                    if let Err(e) = subject_repo.upsert(to_create_subject(bgm_subject)).await {
+                    if let Err(e) = subject_repo.upsert(to_create_subject(bgm_subject, None)).await {
                         tracing::error!(subject_id = entry.bgm_id, error = %e, "upsert subject 失败");
                         failed += 1;
                     } else {
@@ -184,10 +184,10 @@ impl SyncService {
             .delete(season_id)
             .await
             .map_err(anyhow::Error::from)?;
-        if deleted {
-            if let Err(e) = SubjectRepository::new(pool).delete_orphans().await {
-                tracing::warn!(error = %e, "delete_orphans after delete_season 失败");
-            }
+        if deleted
+            && let Err(e) = SubjectRepository::new(pool).delete_orphans().await
+        {
+            tracing::warn!(error = %e, "delete_orphans after delete_season 失败");
         }
         Ok(deleted)
     }
@@ -282,17 +282,36 @@ pub(crate) fn calculate_average_comment(_episodes: &[Episode]) -> Option<f64> {
     None
 }
 
-fn to_create_subject(s: BangumiSubject) -> CreateSubject {
+fn to_create_subject(s: BangumiSubject, avg_comment: Option<f64>) -> CreateSubject {
+    let rank = normalize_rank(s.rating.as_ref().and_then(|r| r.rank));
+    let score = s
+        .rating
+        .as_ref()
+        .and_then(|r| r.count.as_ref())
+        .and_then(calculate_exact_score);
+    let drop_rate = s.collection.as_ref().and_then(calculate_drop_rate);
+    let collection_total = s.collection.as_ref().map(|c| {
+        c.wish + c.collect + c.doing + c.on_hold + c.dropped
+    });
+    let air_weekday = s
+        .infobox
+        .as_deref()
+        .and_then(extract_air_weekday);
+    let meta_tags = dedup_preserving_order(s.meta_tags.unwrap_or_default());
+
     CreateSubject {
         id: s.id,
         name: s.name,
         name_cn: s.name_cn,
         images_grid: s.images.as_ref().and_then(|i| i.grid.clone()),
         images_large: s.images.and_then(|i| i.large),
-        rank: s.rating.as_ref().and_then(|r| r.rank),
-        score: s.rating.and_then(|r| r.score),
-        collection_total: s.collection.map(|c| c.collect),
-        meta_tags: s.meta_tags.unwrap_or_default(),
+        rank,
+        score,
+        collection_total,
+        average_comment: avg_comment,
+        drop_rate,
+        air_weekday,
+        meta_tags,
         ..Default::default()
     }
 }
@@ -300,8 +319,43 @@ fn to_create_subject(s: BangumiSubject) -> CreateSubject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::bangumi::schemas::{Collection, Episode, InfoboxItem};
+    use crate::services::bangumi::schemas::{Collection, Episode, Images, InfoboxItem, Rating};
     use std::collections::HashMap;
+
+    fn make_bgm_subject(rank: Option<i32>, count: HashMap<String, i32>) -> BangumiSubject {
+        BangumiSubject {
+            id: 1,
+            _type: 2,
+            name: Some("Test".to_string()),
+            name_cn: None,
+            summary: None,
+            series: None,
+            nsfw: None,
+            locked: None,
+            date: None,
+            platform: None,
+            images: None,
+            infobox: None,
+            volumes: None,
+            eps: None,
+            total_episodes: None,
+            rating: Some(Rating {
+                rank,
+                total: Some(count.values().sum()),
+                count: Some(count),
+                score: None,
+            }),
+            collection: Some(Collection {
+                wish: 10,
+                collect: 60,
+                doing: 10,
+                on_hold: 10,
+                dropped: 10,
+            }),
+            meta_tags: None,
+            tags: None,
+        }
+    }
 
     // T008 — normalize_rank
     #[test]
@@ -501,6 +555,42 @@ mod tests {
         let svc = SyncService::new(db);
         let result = svc.delete_orphans().await;
         assert!(result.is_ok());
+    }
+
+    // T018 — to_create_subject 专项测试（Red 阶段）
+    #[test]
+    fn test_to_create_subject_rank_zero_becomes_999999() {
+        let mut count = HashMap::new();
+        count.insert("5".to_string(), 1);
+        let s = make_bgm_subject(Some(0), count);
+        let create = to_create_subject(s, None);
+        assert_eq!(create.rank, Some(999999));
+    }
+
+    #[test]
+    fn test_to_create_subject_rank_nonzero_preserved() {
+        let mut count = HashMap::new();
+        count.insert("5".to_string(), 1);
+        let s = make_bgm_subject(Some(42), count);
+        let create = to_create_subject(s, None);
+        assert_eq!(create.rank, Some(42));
+    }
+
+    #[test]
+    fn test_to_create_subject_score_uses_exact_calculation() {
+        let mut count = HashMap::new();
+        count.insert("10".to_string(), 1);
+        count.insert("1".to_string(), 1);
+        let s = make_bgm_subject(None, count);
+        let score = to_create_subject(s, None).score.unwrap();
+        assert!((score - 5.5).abs() < 0.0001, "expected 5.5, got {score}");
+    }
+
+    #[test]
+    fn test_to_create_subject_score_none_when_no_ratings() {
+        let s = make_bgm_subject(None, HashMap::new());
+        let create = to_create_subject(s, None);
+        assert_eq!(create.score, None);
     }
 
     // T011 — delete_season（Red 阶段）
