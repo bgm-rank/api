@@ -62,15 +62,12 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
+    use sqlx::PgPool;
     use tower::ServiceExt;
 
-    #[tokio::test]
-    async fn test_health_check() {
-        dotenvy::dotenv().ok();
-        let database_url = std::env::var("DATABASE_URL").unwrap();
-        let db = Database::new(&database_url).await.unwrap();
-        let db = Arc::new(db);
-
+    #[sqlx::test]
+    async fn test_health_check(pool: PgPool) {
+        let db = Arc::new(Database::from_pool(pool));
         let app = api::create_app(db);
 
         let request = Request::builder()

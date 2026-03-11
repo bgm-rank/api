@@ -31,22 +31,17 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
 
-    #[tokio::test]
-    async fn test_database_new() {
-        dotenvy::dotenv().ok();
-        let database_url = std::env::var("DATABASE_URL").unwrap();
-
-        let db = Database::new(&database_url).await;
-        assert!(db.is_ok());
+    #[sqlx::test]
+    async fn test_database_from_pool(pool: PgPool) {
+        let db = Database::from_pool(pool);
+        assert!(db.ping().await.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_database_ping() {
-        dotenvy::dotenv().ok();
-        let database_url = std::env::var("DATABASE_URL").unwrap();
-        let db = Database::new(&database_url).await.unwrap();
-
+    #[sqlx::test]
+    async fn test_database_ping(pool: PgPool) {
+        let db = Database::from_pool(pool);
         let result = db.ping().await;
         assert!(result.is_ok());
     }

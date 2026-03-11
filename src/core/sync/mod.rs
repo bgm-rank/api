@@ -319,7 +319,8 @@ fn to_create_subject(s: BangumiSubject, avg_comment: Option<f64>) -> CreateSubje
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::bangumi::schemas::{Collection, Episode, Images, InfoboxItem, Rating};
+    use crate::services::bangumi::schemas::{Collection, InfoboxItem, Rating};
+    use sqlx::PgPool;
     use std::collections::HashMap;
 
     fn make_bgm_subject(rank: Option<i32>, count: HashMap<String, i32>) -> BangumiSubject {
@@ -452,14 +453,9 @@ mod tests {
 
     // T012 [US2]: 验证同步开始时 INFO 事件包含 season_id 和 operation 字段
     #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn test_sync_started_log_has_season_id_and_operation() {
-        dotenvy::dotenv().ok();
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(u) => u,
-            Err(_) => return,
-        };
-        let db = Arc::new(Database::new(&database_url).await.unwrap());
+    #[sqlx::test]
+    async fn test_sync_started_log_has_season_id_and_operation(pool: PgPool) {
+        let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
         // month=2 无效，但 sync started 日志应在 month_to_season 之前触发
         let _ = svc.create_and_sync(2026, 2, None).await;
@@ -475,14 +471,9 @@ mod tests {
 
     // T013 [US2]: 验证同步完成时 INFO 事件包含 added, updated, deleted, failed, elapsed_ms 字段
     #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn test_sync_completed_log_has_result_fields() {
-        dotenvy::dotenv().ok();
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(u) => u,
-            Err(_) => return,
-        };
-        let db = Arc::new(Database::new(&database_url).await.unwrap());
+    #[sqlx::test]
+    async fn test_sync_completed_log_has_result_fields(pool: PgPool) {
+        let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
         let result = svc.create_and_sync(2999, 1, None).await;
         if result.is_ok() {
@@ -498,60 +489,35 @@ mod tests {
     }
 
     // T019 — SyncService::create_and_sync / resync
-    #[test]
-    fn test_create_and_sync_invalid_month_returns_err() {
-        // create_and_sync 内部调用 month_to_season，无效月份应立即返回 Err
-        // 使用 block_on 避免 tokio runtime 依赖 DATABASE_URL
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        dotenvy::dotenv().ok();
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(u) => u,
-            Err(_) => return, // CI 无数据库时跳过
-        };
-        rt.block_on(async {
-            let db = Arc::new(Database::new(&database_url).await.unwrap());
-            let svc = SyncService::new(db);
-            let result = svc.create_and_sync(2026, 2, None).await;
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("Invalid month"));
-        });
+    #[sqlx::test]
+    async fn test_create_and_sync_invalid_month_returns_err(pool: PgPool) {
+        let db = Arc::new(Database::from_pool(pool));
+        let svc = SyncService::new(db);
+        let result = svc.create_and_sync(2026, 2, None).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid month"));
     }
 
-    #[tokio::test]
-    async fn test_resync_unknown_season_returns_err() {
-        dotenvy::dotenv().ok();
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(u) => u,
-            Err(_) => return,
-        };
-        let db = Arc::new(Database::new(&database_url).await.unwrap());
+    #[sqlx::test]
+    async fn test_resync_unknown_season_returns_err(pool: PgPool) {
+        let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
         let result = svc.resync(999999).await;
         assert!(result.is_err());
     }
 
     // T037 — SyncService::find_orphans / delete_orphans
-    #[tokio::test]
-    async fn test_find_orphans_returns_ok() {
-        dotenvy::dotenv().ok();
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(u) => u,
-            Err(_) => return,
-        };
-        let db = Arc::new(Database::new(&database_url).await.unwrap());
+    #[sqlx::test]
+    async fn test_find_orphans_returns_ok(pool: PgPool) {
+        let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
         let result = svc.find_orphans().await;
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_delete_orphans_returns_ok() {
-        dotenvy::dotenv().ok();
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(u) => u,
-            Err(_) => return,
-        };
-        let db = Arc::new(Database::new(&database_url).await.unwrap());
+    #[sqlx::test]
+    async fn test_delete_orphans_returns_ok(pool: PgPool) {
+        let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
         let result = svc.delete_orphans().await;
         assert!(result.is_ok());
@@ -594,18 +560,12 @@ mod tests {
     }
 
     // T011 — delete_season（Red 阶段）
-    #[tokio::test]
-    async fn test_delete_season_existing_returns_true() {
-        dotenvy::dotenv().ok();
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(u) => u,
-            Err(_) => return,
-        };
-        let db = Arc::new(Database::new(&database_url).await.unwrap());
-        let pool = db.pool();
+    #[sqlx::test]
+    async fn test_delete_season_existing_returns_true(pool: PgPool) {
+        let db = Arc::new(Database::from_pool(pool));
 
         // 创建 season 202699
-        SeasonRepository::new(pool)
+        SeasonRepository::new(db.pool())
             .upsert(CreateSeason {
                 season_id: 202699,
                 year: 2026,
@@ -621,19 +581,13 @@ mod tests {
         assert!(result.unwrap(), "should return true for existing season");
 
         // 验证 season 已从 DB 消失
-        let pool2 = svc.db.pool();
-        let found = SeasonRepository::new(pool2).find_by_id(202699).await.unwrap();
+        let found = SeasonRepository::new(svc.db.pool()).find_by_id(202699).await.unwrap();
         assert!(found.is_none(), "season should be deleted from DB");
     }
 
-    #[tokio::test]
-    async fn test_delete_season_nonexistent_returns_false() {
-        dotenvy::dotenv().ok();
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(u) => u,
-            Err(_) => return,
-        };
-        let db = Arc::new(Database::new(&database_url).await.unwrap());
+    #[sqlx::test]
+    async fn test_delete_season_nonexistent_returns_false(pool: PgPool) {
+        let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
         let result = svc.delete_season(999989).await;
         assert!(result.is_ok());
