@@ -9,3 +9,4 @@ GEMINI.md
 
 /target
 mutants.out/
+mutants.out.old/

@@ -881,4 +881,200 @@ mod tests {
     fn test_month_to_season_invalid() {
         assert!(month_to_season(2).is_err());
     }
+
+    // T008 [US2]: dropped=100, others=0 → rate=1.0（杀死 + → - 和 + → * 变异体）
+    #[test]
+    fn test_calculate_drop_rate_all_dropped_returns_1() {
+        let c = Collection {
+            wish: 0,
+            collect: 0,
+            doing: 0,
+            on_hold: 0,
+            dropped: 100,
+        };
+        let rate = calculate_drop_rate(&c).unwrap();
+        assert!(
+            (rate - 1.0).abs() < 0.0001,
+            "expected 1.0, got {rate}"
+        );
+    }
+
+    // T009 [US2]: dropped=0, collect=100 → rate=0.0（杀死 / → * 和 / → % 变异体）
+    #[test]
+    fn test_calculate_drop_rate_zero_dropped_returns_0() {
+        let c = Collection {
+            wish: 0,
+            collect: 100,
+            doing: 0,
+            on_hold: 0,
+            dropped: 0,
+        };
+        let rate = calculate_drop_rate(&c).unwrap();
+        assert!(
+            rate.abs() < 0.0001,
+            "expected 0.0, got {rate}"
+        );
+    }
+
+    // T010 [US2]: airdate == today 应被包含（验证 <= 而非 <，杀死 <= → > 变异体）
+    #[test]
+    fn test_calculate_average_comment_today_boundary() {
+        use chrono::NaiveDate;
+        let today = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
+        let episodes = vec![make_episode(1, 0, "2026-03-10", Some(42))];
+        let avg = calculate_average_comment(&episodes, today);
+        assert_eq!(avg, Some(42.0), "airdate == today 的集应被纳入计算");
+    }
+
+    // T011 [US2]: count={{"7": 1}} → score=7.0（验证单条目加权计算，杀死 * → / 变异体）
+    #[test]
+    fn test_calculate_exact_score_single_entry() {
+        let mut count = HashMap::new();
+        count.insert("7".to_string(), 2); // v=2 使 * 与 / 产生不同结果
+        let score = calculate_exact_score(&count).unwrap();
+        assert!(
+            (score - 7.0).abs() < 0.0001,
+            "expected 7.0, got {score}"
+        );
+    }
+
+    // T012 [US2]: ["A","A","A"] → ["A"]（杀死 dedup 返回常量变异体）
+    #[test]
+    fn test_dedup_preserving_order_all_duplicates() {
+        let input = vec!["A".to_string(), "A".to_string(), "A".to_string()];
+        assert_eq!(dedup_preserving_order(input), vec!["A".to_string()]);
+    }
+
+    // T013 [US2]: ["C","A","B","A","C"] → ["C","A","B"]（验证顺序保持）
+    #[test]
+    fn test_dedup_preserving_order_preserves_order_with_multiple() {
+        let input = vec![
+            "C".to_string(),
+            "A".to_string(),
+            "B".to_string(),
+            "A".to_string(),
+            "C".to_string(),
+        ];
+        assert_eq!(
+            dedup_preserving_order(input),
+            vec!["C".to_string(), "A".to_string(), "B".to_string()]
+        );
+    }
+
+    // T014 [US2]: 错误消息包含 "Invalid month"（杀死 month_to_season 返回空字符串变异体）
+    #[test]
+    fn test_month_to_season_invalid_contains_message() {
+        let err = month_to_season(2).unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid month"),
+            "error should contain 'Invalid month', got: {err}"
+        );
+    }
+
+    // ── 补充测试：杀死 media_type_to_str / rating_to_str 返回值变异体 ──
+
+    #[test]
+    fn test_media_type_to_str_returns_correct_values() {
+        use crate::services::season_data::MediaType;
+        assert_eq!(media_type_to_str(&MediaType::Tv), "tv");
+        assert_eq!(media_type_to_str(&MediaType::Movie), "movie");
+        assert_eq!(media_type_to_str(&MediaType::Ova), "ova");
+        assert_eq!(media_type_to_str(&MediaType::Ona), "ona");
+        assert_eq!(media_type_to_str(&MediaType::TvSpecial), "tv_special");
+    }
+
+    #[test]
+    fn test_rating_to_str_returns_correct_values() {
+        use crate::services::season_data::Rating as SeasonRating;
+        assert_eq!(rating_to_str(&SeasonRating::General), "general");
+        assert_eq!(rating_to_str(&SeasonRating::Kids), "kids");
+        assert_eq!(rating_to_str(&SeasonRating::R18), "r18");
+    }
+
+    // ── 补充测试：杀死 calculate_average_comment L319 / → * 变异体 ──
+
+    #[test]
+    fn test_calculate_average_comment_multiple_episodes_exact_avg() {
+        use chrono::NaiveDate;
+        let today = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
+        // 2 个已播出集，评论数分别为 10 和 20，平均值应为 15.0
+        // / → * 变异体: (10+20)*2 = 60 ≠ 15.0，测试可杀死该变异体
+        let episodes = vec![
+            make_episode(1, 0, "2026-01-01", Some(10)),
+            make_episode(2, 0, "2026-02-01", Some(20)),
+        ];
+        let avg = calculate_average_comment(&episodes, today);
+        assert!(
+            (avg.unwrap() - 15.0).abs() < 0.0001,
+            "expected 15.0, got {:?}",
+            avg
+        );
+    }
+
+    // ── 补充测试：杀死 to_create_subject L333 collection_total 算术变异体 ──
+
+    #[test]
+    fn test_to_create_subject_collection_total_sums_all_components() {
+        // wish=1,collect=2,doing=3,on_hold=4,dropped=5 → total=15
+        // + → - 变异体会给出错误总和，+ → * 变异体同样
+        let s = make_subject_with_infobox(
+            None,
+            Some(Collection {
+                wish: 1,
+                collect: 2,
+                doing: 3,
+                on_hold: 4,
+                dropped: 5,
+            }),
+        );
+        let create = to_create_subject(s, None);
+        assert_eq!(create.collection_total, Some(15));
+    }
+
+    // ── 补充测试：杀死 to_create_subject L338-342,L345 字段删除变异体 ──
+
+    #[test]
+    fn test_to_create_subject_maps_id_name_name_cn() {
+        use crate::services::bangumi::schemas::Images;
+        let s = BangumiSubject {
+            id: 42,
+            _type: 2,
+            name: Some("テスト".to_string()),
+            name_cn: Some("测试".to_string()),
+            images: Some(Images {
+                large: Some("large_url".to_string()),
+                common: None,
+                medium: None,
+                small: None,
+                grid: Some("grid_url".to_string()),
+            }),
+            summary: None,
+            series: None,
+            nsfw: None,
+            locked: None,
+            date: None,
+            platform: None,
+            infobox: None,
+            volumes: None,
+            eps: None,
+            total_episodes: None,
+            rating: None,
+            collection: Some(Collection {
+                wish: 1,
+                collect: 2,
+                doing: 3,
+                on_hold: 4,
+                dropped: 5,
+            }),
+            meta_tags: None,
+            tags: None,
+        };
+        let create = to_create_subject(s, None);
+        assert_eq!(create.id, 42);                                            // kills L338 delete field id
+        assert_eq!(create.name, Some("テスト".to_string()));                   // kills L339 delete field name
+        assert_eq!(create.name_cn, Some("测试".to_string()));                  // kills L340 delete field name_cn
+        assert_eq!(create.images_grid, Some("grid_url".to_string()));         // kills L341 delete field images_grid
+        assert_eq!(create.images_large, Some("large_url".to_string()));       // kills L342 delete field images_large
+        assert_eq!(create.collection_total, Some(15));                        // kills L345 delete field collection_total
+    }
 }
