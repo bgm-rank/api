@@ -8,3 +8,4 @@ GEMINI.md
 .env
 
 /target
+mutants.out/
