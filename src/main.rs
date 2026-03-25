@@ -43,7 +43,8 @@ async fn main() {
     // T007 [US1]: 数据库连接成功后记录启动日志
     log_service_started(addr);
 
-    let scheduler = SchedulerService::new(Arc::clone(&db));
+    let deploy_hook_url = std::env::var("DEPLOY_HOOK_URL").ok();
+    let scheduler = SchedulerService::new_with_deploy_hook(Arc::clone(&db), deploy_hook_url);
     tokio::spawn(async move {
         if let Err(e) = scheduler.run().await {
             tracing::error!(error = %e, "Scheduler error");

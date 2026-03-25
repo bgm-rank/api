@@ -893,10 +893,7 @@ mod tests {
             dropped: 100,
         };
         let rate = calculate_drop_rate(&c).unwrap();
-        assert!(
-            (rate - 1.0).abs() < 0.0001,
-            "expected 1.0, got {rate}"
-        );
+        assert!((rate - 1.0).abs() < 0.0001, "expected 1.0, got {rate}");
     }
 
     // T009 [US2]: dropped=0, collect=100 → rate=0.0（杀死 / → * 和 / → % 变异体）
@@ -910,10 +907,7 @@ mod tests {
             dropped: 0,
         };
         let rate = calculate_drop_rate(&c).unwrap();
-        assert!(
-            rate.abs() < 0.0001,
-            "expected 0.0, got {rate}"
-        );
+        assert!(rate.abs() < 0.0001, "expected 0.0, got {rate}");
     }
 
     // T010 [US2]: airdate == today 应被包含（验证 <= 而非 <，杀死 <= → > 变异体）
@@ -932,10 +926,7 @@ mod tests {
         let mut count = HashMap::new();
         count.insert("7".to_string(), 2); // v=2 使 * 与 / 产生不同结果
         let score = calculate_exact_score(&count).unwrap();
-        assert!(
-            (score - 7.0).abs() < 0.0001,
-            "expected 7.0, got {score}"
-        );
+        assert!((score - 7.0).abs() < 0.0001, "expected 7.0, got {score}");
     }
 
     // T012 [US2]: ["A","A","A"] → ["A"]（杀死 dedup 返回常量变异体）
@@ -1070,11 +1061,11 @@ mod tests {
             tags: None,
         };
         let create = to_create_subject(s, None);
-        assert_eq!(create.id, 42);                                            // kills L338 delete field id
-        assert_eq!(create.name, Some("テスト".to_string()));                   // kills L339 delete field name
-        assert_eq!(create.name_cn, Some("测试".to_string()));                  // kills L340 delete field name_cn
-        assert_eq!(create.images_grid, Some("grid_url".to_string()));         // kills L341 delete field images_grid
-        assert_eq!(create.images_large, Some("large_url".to_string()));       // kills L342 delete field images_large
-        assert_eq!(create.collection_total, Some(15));                        // kills L345 delete field collection_total
+        assert_eq!(create.id, 42); // kills L338 delete field id
+        assert_eq!(create.name, Some("テスト".to_string())); // kills L339 delete field name
+        assert_eq!(create.name_cn, Some("测试".to_string())); // kills L340 delete field name_cn
+        assert_eq!(create.images_grid, Some("grid_url".to_string())); // kills L341 delete field images_grid
+        assert_eq!(create.images_large, Some("large_url".to_string())); // kills L342 delete field images_large
+        assert_eq!(create.collection_total, Some(15)); // kills L345 delete field collection_total
     }
 }

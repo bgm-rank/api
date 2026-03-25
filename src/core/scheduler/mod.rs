@@ -1,9 +1,11 @@
 use anyhow::Result;
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveTime, TimeZone, Utc};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dal::Database;
 use crate::services::bangumi::BangumiClient;
+use crate::services::deploy_hook::DeployHookClient;
 
 // ── Scheduler timing ──────────────────────────────────────────────────────────
 
@@ -80,18 +82,44 @@ pub fn is_due(age: i32, last_updated_at: Option<&DateTime<Utc>>, now: DateTime<U
     }
 }
 
+// ── Concurrency guard ──────────────────────────────────────────────────────────
+
+pub(super) fn try_acquire_run(flag: &AtomicBool) -> bool {
+    flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+// ── TickStats ──────────────────────────────────────────────────────────────────
+
+#[derive(Default)]
+pub(super) struct TickStats {
+    pub due_count: usize,
+    pub success_count: usize,
+    pub fail_count: usize,
+    pub elapsed_ms: u64,
+}
+
 // ── Scheduler service ─────────────────────────────────────────────────────────
 
 pub struct SchedulerService {
     db: Arc<Database>,
     bangumi_client: BangumiClient,
+    deploy_hook_client: DeployHookClient,
+    is_running: Arc<AtomicBool>,
 }
 
 impl SchedulerService {
+    #[allow(dead_code)]
     pub fn new(db: Arc<Database>) -> Self {
+        Self::new_with_deploy_hook(db, None)
+    }
+
+    pub fn new_with_deploy_hook(db: Arc<Database>, deploy_hook_url: Option<String>) -> Self {
         Self {
             db,
             bangumi_client: BangumiClient::new(),
+            deploy_hook_client: DeployHookClient::new(deploy_hook_url),
+            is_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -111,7 +139,11 @@ impl SchedulerService {
             sleep_until(Instant::now() + wait).await;
 
             tick_count += 1;
-            tracing::info!("调度器触发，开始本轮番剧详情更新");
+
+            if !try_acquire_run(&self.is_running) {
+                tracing::warn!(tick = tick_count, "上一轮调度尚未完成，跳过本次 tick");
+                continue;
+            }
 
             let today = chrono::Utc::now().date_naive();
             let (year, month) = current_quarter(today);
@@ -128,7 +160,20 @@ impl SchedulerService {
                 }
             };
 
+            tracing::info!(
+                tick = tick_count,
+                due = due_subjects.len(),
+                event_type = "start",
+                "调度器触发"
+            );
+
+            let mut stats = TickStats {
+                due_count: due_subjects.len(),
+                ..Default::default()
+            };
+
             let today = chrono::Utc::now().date_naive();
+            let tick_start = std::time::Instant::now();
 
             for (subject_id, _, _) in due_subjects {
                 let avg_comment = match self
@@ -148,14 +193,17 @@ impl SchedulerService {
                         let create = crate::core::sync::to_create_subject(bgm_subject, avg_comment);
                         if let Err(e) = subject_repo.upsert(create).await {
                             tracing::error!(subject_id, error = %e, "调度器 upsert subject 失败");
+                            stats.fail_count += 1;
                             continue;
                         }
                         if let Err(e) = subject_repo.update_last_updated_at(subject_id).await {
                             tracing::error!(subject_id, error = %e, "update_last_updated_at 失败");
                         }
+                        stats.success_count += 1;
                     }
                     Err(e) => {
                         tracing::error!(subject_id, error = %e, "调度器拉取 subject 失败");
+                        stats.fail_count += 1;
                     }
                 }
 
@@ -170,8 +218,23 @@ impl SchedulerService {
                 tracing::warn!(current_season_id, error = %e, "调度器 touch_updated_at 失败");
             }
 
-            // T023: tick complete log
-            tracing::info!(tick = tick_count, event_type = "complete", "scheduler tick");
+            if stats.success_count > 0
+                && let Err(e) = self.deploy_hook_client.trigger().await
+            {
+                tracing::error!(error = %e, "Deploy Hook 触发失败");
+            }
+
+            stats.elapsed_ms = tick_start.elapsed().as_millis() as u64;
+            tracing::info!(
+                tick = tick_count,
+                due = stats.due_count,
+                success = stats.success_count,
+                fail = stats.fail_count,
+                elapsed_ms = stats.elapsed_ms,
+                event_type = "complete",
+                "scheduler tick"
+            );
+            self.is_running.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -180,6 +243,50 @@ impl SchedulerService {
 mod tests {
     use super::*;
     use chrono::{FixedOffset, TimeZone, Utc};
+
+    /// 构造 CST（UTC+8）2026-03-10 当日 h:m:s 对应的 UTC 时间
+    fn cst_at(h: u32, m: u32, s: u32) -> DateTime<Utc> {
+        let offset = FixedOffset::east_opt(8 * 3600).unwrap();
+        offset
+            .with_ymd_and_hms(2026, 3, 10, h, m, s)
+            .unwrap()
+            .to_utc()
+    }
+
+    // T016: subject 级别错误隔离
+    // run() 中对每个 subject 的拉取/upsert 失败均使用 continue，不终止外层循环。
+    // 这确保单个 subject 异常不影响其他 subjects 的更新。
+
+    // T014 🔴 → T015 🟢
+    #[test]
+    fn test_is_running_guard_skips_when_busy() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = AtomicBool::new(false);
+        // 首次获取应成功
+        assert!(try_acquire_run(&flag));
+        // flag 已为 true，再次获取应失败
+        assert!(!try_acquire_run(&flag));
+        // 释放后可再次获取
+        flag.store(false, Ordering::SeqCst);
+        assert!(try_acquire_run(&flag));
+    }
+
+    // T010 🔴 → T011 🟢
+    #[test]
+    fn test_scheduler_new_accepts_deploy_hook_url() {
+        // 编译期验证 new_with_deploy_hook 函数签名存在且类型匹配
+        let _f: fn(Arc<Database>, Option<String>) -> SchedulerService =
+            SchedulerService::new_with_deploy_hook;
+    }
+
+    // T004 🔴 → T005 🟢
+    #[test]
+    fn test_tick_stats_defaults() {
+        let stats = TickStats::default();
+        assert_eq!(stats.due_count, 0);
+        assert_eq!(stats.success_count, 0);
+        assert_eq!(stats.fail_count, 0);
+    }
 
     // T030 🔴 → T031 🟢
 

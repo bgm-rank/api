@@ -1,4 +1,5 @@
 pub mod bangumi;
+pub mod deploy_hook;
 pub mod season_data;
 
 #[allow(unused_imports)]
