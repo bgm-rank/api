@@ -44,7 +44,6 @@ pub struct CreateSubject {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct UpdateSubject {
     pub name: Option<String>,
     pub name_cn: Option<String>,

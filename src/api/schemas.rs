@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::core::scheduler::PublicTickStats;
+
 #[derive(Serialize)]
 #[allow(dead_code)]
 pub struct MessageResponse {
@@ -73,4 +75,49 @@ pub struct DeleteOrphansResponse {
 pub struct DeleteSeasonResponse {
     pub season_id: i32,
     pub deleted: bool,
+}
+
+// T013: New schemas for admin API
+
+#[derive(Serialize)]
+pub struct AcceptedResponse {
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Serialize)]
+pub struct SchedulerStatusResponse {
+    pub is_running: bool,
+    pub last_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_stats: Option<PublicTickStats>,
+}
+
+#[derive(Deserialize)]
+pub struct EditSubjectRequest {
+    pub name: Option<String>,
+    pub name_cn: Option<String>,
+    pub images_grid: Option<String>,
+    pub images_large: Option<String>,
+    pub rank: Option<i32>,
+    pub score: Option<f64>,
+    pub collection_total: Option<i32>,
+    pub average_comment: Option<f64>,
+    pub drop_rate: Option<f64>,
+    pub air_weekday: Option<String>,
+    pub meta_tags: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+pub struct EditSeasonRequest {
+    pub name: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DeletedResponse {
+    pub deleted: bool,
+}
+
+#[derive(Serialize)]
+pub struct RemovedResponse {
+    pub removed: bool,
 }

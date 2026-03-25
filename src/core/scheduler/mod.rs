@@ -1,7 +1,10 @@
 use anyhow::Result;
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveTime, TimeZone, Utc};
+use serde::Serialize;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 
 use crate::dal::Database;
 use crate::services::bangumi::BangumiClient;
@@ -99,33 +102,77 @@ pub(super) struct TickStats {
     pub elapsed_ms: u64,
 }
 
+// ── PublicTickStats ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicTickStats {
+    pub run_at: chrono::DateTime<chrono::Utc>,
+    pub due_count: usize,
+    pub success_count: usize,
+    pub fail_count: usize,
+    pub elapsed_ms: u64,
+}
+
+// ── SchedulerHandle ────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct SchedulerHandle {
+    pub is_running: Arc<AtomicBool>,
+    pub last_stats: Arc<Mutex<Option<PublicTickStats>>>,
+    pub manual_trigger: Arc<Notify>,
+}
+
+impl SchedulerHandle {
+    pub fn new() -> Self {
+        Self {
+            is_running: Arc::new(AtomicBool::new(false)),
+            last_stats: Arc::new(Mutex::new(None)),
+            manual_trigger: Arc::new(Notify::new()),
+        }
+    }
+}
+
+impl Default for SchedulerHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Scheduler service ─────────────────────────────────────────────────────────
 
 pub struct SchedulerService {
     db: Arc<Database>,
     bangumi_client: BangumiClient,
     deploy_hook_client: DeployHookClient,
-    is_running: Arc<AtomicBool>,
+    handle: SchedulerHandle,
 }
 
 impl SchedulerService {
     #[allow(dead_code)]
     pub fn new(db: Arc<Database>) -> Self {
-        Self::new_with_deploy_hook(db, None)
+        Self::new_with_deploy_hook(db, None, SchedulerHandle::new())
     }
 
-    pub fn new_with_deploy_hook(db: Arc<Database>, deploy_hook_url: Option<String>) -> Self {
+    pub fn new_with_deploy_hook(
+        db: Arc<Database>,
+        deploy_hook_url: Option<String>,
+        handle: SchedulerHandle,
+    ) -> Self {
         Self {
             db,
             bangumi_client: BangumiClient::new(),
             deploy_hook_client: DeployHookClient::new(deploy_hook_url),
-            is_running: Arc::new(AtomicBool::new(false)),
+            handle,
         }
     }
 
+    #[allow(dead_code)]
+    pub fn handle(&self) -> SchedulerHandle {
+        self.handle.clone()
+    }
+
     pub async fn run(self) -> Result<()> {
-        use crate::dal::SubjectRepository;
-        use tokio::time::{Duration, Instant, sleep, sleep_until};
+        use tokio::time::{Duration, Instant, sleep_until};
 
         tracing::info!("调度器已启动");
 
@@ -136,107 +183,145 @@ impl SchedulerService {
             let cst = FixedOffset::east_opt(8 * 3600).unwrap();
             tracing::info!("下次触发时间: {}", next.with_timezone(&cst));
             let wait = (next - now).to_std().unwrap_or(Duration::from_secs(0));
-            sleep_until(Instant::now() + wait).await;
+            let sleep_future = sleep_until(Instant::now() + wait);
+
+            tokio::select! {
+                _ = sleep_future => {},
+                _ = self.handle.manual_trigger.notified() => {
+                    tracing::info!("调度器被手动触发");
+                }
+            }
 
             tick_count += 1;
 
-            if !try_acquire_run(&self.is_running) {
+            if !try_acquire_run(&self.handle.is_running) {
                 tracing::warn!(tick = tick_count, "上一轮调度尚未完成，跳过本次 tick");
                 continue;
             }
 
-            let today = chrono::Utc::now().date_naive();
-            let (year, month) = current_quarter(today);
-            let current_season_id = year * 100 + month as i32;
-
-            let pool = self.db.pool();
-            let subject_repo = SubjectRepository::new(pool);
-
-            let due_subjects = match subject_repo.find_due_for_update(current_season_id).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(tick = tick_count, event_type = "error", error = %e, "find_due_for_update 失败");
-                    continue;
-                }
-            };
-
-            tracing::info!(
-                tick = tick_count,
-                due = due_subjects.len(),
-                event_type = "start",
-                "调度器触发"
-            );
-
-            let mut stats = TickStats {
-                due_count: due_subjects.len(),
-                ..Default::default()
-            };
-
-            let today = chrono::Utc::now().date_naive();
-            let tick_start = std::time::Instant::now();
-
-            for (subject_id, _, _) in due_subjects {
-                let avg_comment = match self
-                    .bangumi_client
-                    .get_episodes(subject_id, 0, 100, 0)
-                    .await
-                {
-                    Ok(paged) => crate::core::sync::calculate_average_comment(&paged.data, today),
-                    Err(e) => {
-                        tracing::warn!(subject_id, error = %e, "调度器拉取 episodes 失败，降级为 None");
-                        None
-                    }
-                };
-
-                match self.bangumi_client.get_subject(subject_id).await {
-                    Ok(bgm_subject) => {
-                        let create = crate::core::sync::to_create_subject(bgm_subject, avg_comment);
-                        if let Err(e) = subject_repo.upsert(create).await {
-                            tracing::error!(subject_id, error = %e, "调度器 upsert subject 失败");
-                            stats.fail_count += 1;
-                            continue;
-                        }
-                        if let Err(e) = subject_repo.update_last_updated_at(subject_id).await {
-                            tracing::error!(subject_id, error = %e, "update_last_updated_at 失败");
-                        }
-                        stats.success_count += 1;
-                    }
-                    Err(e) => {
-                        tracing::error!(subject_id, error = %e, "调度器拉取 subject 失败");
-                        stats.fail_count += 1;
-                    }
-                }
-
-                sleep(Duration::from_millis(500)).await;
-            }
-
-            // 更新当前季度的 updated_at 时间戳
-            if let Err(e) = crate::dal::SeasonRepository::new(pool)
-                .touch_updated_at(current_season_id)
-                .await
-            {
-                tracing::warn!(current_season_id, error = %e, "调度器 touch_updated_at 失败");
-            }
-
-            if stats.success_count > 0
-                && let Err(e) = self.deploy_hook_client.trigger().await
-            {
-                tracing::error!(error = %e, "Deploy Hook 触发失败");
-            }
-
-            stats.elapsed_ms = tick_start.elapsed().as_millis() as u64;
-            tracing::info!(
-                tick = tick_count,
-                due = stats.due_count,
-                success = stats.success_count,
-                fail = stats.fail_count,
-                elapsed_ms = stats.elapsed_ms,
-                event_type = "complete",
-                "scheduler tick"
-            );
-            self.is_running.store(false, Ordering::SeqCst);
+            run_tick(
+                &self.db,
+                &self.bangumi_client,
+                &self.deploy_hook_client,
+                &self.handle,
+                tick_count,
+            )
+            .await;
         }
     }
+}
+
+pub(super) async fn run_tick(
+    db: &Arc<Database>,
+    bangumi_client: &BangumiClient,
+    deploy_hook_client: &DeployHookClient,
+    handle: &SchedulerHandle,
+    tick_count: u64,
+) -> TickStats {
+    use crate::dal::SubjectRepository;
+    use tokio::time::{Duration, sleep};
+
+    let run_at = Utc::now();
+    let today = run_at.date_naive();
+    let (year, month) = current_quarter(today);
+    let current_season_id = year * 100 + month as i32;
+
+    let pool = db.pool();
+    let subject_repo = SubjectRepository::new(pool);
+
+    let due_subjects = match subject_repo.find_due_for_update(current_season_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(tick = tick_count, event_type = "error", error = %e, "find_due_for_update 失败");
+            handle.is_running.store(false, Ordering::SeqCst);
+            return TickStats::default();
+        }
+    };
+
+    tracing::info!(
+        tick = tick_count,
+        due = due_subjects.len(),
+        event_type = "start",
+        "调度器触发"
+    );
+
+    let mut stats = TickStats {
+        due_count: due_subjects.len(),
+        ..Default::default()
+    };
+
+    let tick_start = std::time::Instant::now();
+
+    for (subject_id, _, _) in due_subjects {
+        let avg_comment = match bangumi_client.get_episodes(subject_id, 0, 100, 0).await {
+            Ok(paged) => crate::core::sync::calculate_average_comment(&paged.data, today),
+            Err(e) => {
+                tracing::warn!(subject_id, error = %e, "调度器拉取 episodes 失败，降级为 None");
+                None
+            }
+        };
+
+        match bangumi_client.get_subject(subject_id).await {
+            Ok(bgm_subject) => {
+                let create = crate::core::sync::to_create_subject(bgm_subject, avg_comment);
+                if let Err(e) = subject_repo.upsert(create).await {
+                    tracing::error!(subject_id, error = %e, "调度器 upsert subject 失败");
+                    stats.fail_count += 1;
+                    continue;
+                }
+                if let Err(e) = subject_repo.update_last_updated_at(subject_id).await {
+                    tracing::error!(subject_id, error = %e, "update_last_updated_at 失败");
+                }
+                stats.success_count += 1;
+            }
+            Err(e) => {
+                tracing::error!(subject_id, error = %e, "调度器拉取 subject 失败");
+                stats.fail_count += 1;
+            }
+        }
+
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    // 更新当前季度的 updated_at 时间戳
+    if let Err(e) = crate::dal::SeasonRepository::new(pool)
+        .touch_updated_at(current_season_id)
+        .await
+    {
+        tracing::warn!(current_season_id, error = %e, "调度器 touch_updated_at 失败");
+    }
+
+    if stats.success_count > 0
+        && let Err(e) = deploy_hook_client.trigger().await
+    {
+        tracing::error!(error = %e, "Deploy Hook 触发失败");
+    }
+
+    stats.elapsed_ms = tick_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        tick = tick_count,
+        due = stats.due_count,
+        success = stats.success_count,
+        fail = stats.fail_count,
+        elapsed_ms = stats.elapsed_ms,
+        event_type = "complete",
+        "scheduler tick"
+    );
+
+    // 写入 last_stats
+    let public_stats = PublicTickStats {
+        run_at,
+        due_count: stats.due_count,
+        success_count: stats.success_count,
+        fail_count: stats.fail_count,
+        elapsed_ms: stats.elapsed_ms,
+    };
+    if let Ok(mut guard) = handle.last_stats.lock() {
+        *guard = Some(public_stats);
+    }
+
+    handle.is_running.store(false, Ordering::SeqCst);
+    stats
 }
 
 #[cfg(test)]
@@ -271,11 +356,11 @@ mod tests {
         assert!(try_acquire_run(&flag));
     }
 
-    // T010 🔴 → T011 🟢
+    // T010 🔴 → T011 🟢 (updated signature)
     #[test]
     fn test_scheduler_new_accepts_deploy_hook_url() {
         // 编译期验证 new_with_deploy_hook 函数签名存在且类型匹配
-        let _f: fn(Arc<Database>, Option<String>) -> SchedulerService =
+        let _f: fn(Arc<Database>, Option<String>, SchedulerHandle) -> SchedulerService =
             SchedulerService::new_with_deploy_hook;
     }
 
@@ -416,5 +501,25 @@ mod tests {
         let now = cst(3, 59, 59);
         let expected = cst(4, 0, 0);
         assert_eq!(next_scheduled_instant(now), expected);
+    }
+
+    // T003 → T004: SchedulerHandle 测试
+    #[tokio::test]
+    async fn test_scheduler_handle_new_is_not_running() {
+        let handle = SchedulerHandle::new();
+        assert!(!handle.is_running.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_handle_manual_trigger_notifies() {
+        let handle = SchedulerHandle::new();
+        handle.manual_trigger.notify_one();
+        handle.manual_trigger.notified().await; // should complete immediately
+    }
+
+    // suppress unused warning for cst_at
+    #[allow(dead_code)]
+    fn _use_cst_at() {
+        let _ = cst_at(0, 0, 0);
     }
 }

@@ -19,9 +19,8 @@ use crate::dal::Database;
 
 use endpoints::{AppState, admin_router, get_season_subjects, health_check, list_seasons};
 
-/// 构建带有完整中间件栈的应用 Router
-pub fn create_app(db: Arc<Database>) -> Router {
-    let state = AppState::new(db);
+/// 构建带有完整中间件栈的应用 Router（从已有 AppState 构建）
+pub fn create_app_from_state(state: AppState) -> Router {
     let admin = admin_router(state.clone());
 
     Router::new()
@@ -67,6 +66,12 @@ pub fn create_app(db: Arc<Database>) -> Router {
             ),
         )
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+}
+
+/// 构建带有完整中间件栈的应用 Router
+#[allow(dead_code)]
+pub fn create_app(db: Arc<Database>) -> Router {
+    create_app_from_state(AppState::new(db))
 }
 
 #[cfg(test)]

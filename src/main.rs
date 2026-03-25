@@ -5,7 +5,9 @@ mod services;
 
 use std::sync::Arc;
 
-use crate::core::scheduler::SchedulerService;
+use crate::api::create_app_from_state;
+use crate::api::endpoints::AppState;
+use crate::core::scheduler::{SchedulerHandle, SchedulerService};
 use crate::dal::db::Database;
 use tracing_subscriber::EnvFilter;
 
@@ -44,14 +46,20 @@ async fn main() {
     log_service_started(addr);
 
     let deploy_hook_url = std::env::var("DEPLOY_HOOK_URL").ok();
-    let scheduler = SchedulerService::new_with_deploy_hook(Arc::clone(&db), deploy_hook_url);
+
+    // 创建 AppState（包含 SchedulerHandle）
+    let state = AppState::new(Arc::clone(&db));
+    let handle: SchedulerHandle = state.scheduler_handle.as_ref().clone();
+
+    let scheduler =
+        SchedulerService::new_with_deploy_hook(Arc::clone(&db), deploy_hook_url, handle);
     tokio::spawn(async move {
         if let Err(e) = scheduler.run().await {
             tracing::error!(error = %e, "Scheduler error");
         }
     });
 
-    axum::serve(listener, api::create_app(db))
+    axum::serve(listener, create_app_from_state(state))
         .await
         .expect("服务器运行错误");
 }

@@ -142,6 +142,20 @@ impl<'a> SeasonSubjectRepository<'a> {
         Ok(row)
     }
 
+    pub async fn delete_by_season_and_subject(
+        &self,
+        season_id: i32,
+        subject_id: i32,
+    ) -> Result<bool, sqlx::Error> {
+        let result =
+            sqlx::query("DELETE FROM season_subjects WHERE season_id = $1 AND subject_id = $2")
+                .bind(season_id)
+                .bind(subject_id)
+                .execute(self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn delete_and_cleanup(
         &self,
         season_id: i32,
