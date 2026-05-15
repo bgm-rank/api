@@ -1,0 +1,22 @@
+name: Build container release images
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-image:
+    uses: ./.github/workflows/build-container-image.yml
+    with:
+      platforms: linux/amd64
+      push_to_images: |
+        hexsix/bgm-rank-api
+      flavor: |
+        latest=auto
+      tags: |
+        type=pep440,pattern={{raw}}
+        type=pep440,pattern=v{{major}}.{{minor}}
+    secrets: inherit
