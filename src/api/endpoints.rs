@@ -100,6 +100,39 @@ pub async fn get_season_subjects(
     }
 }
 
+pub async fn get_current_season(State(state): State<AppState>) -> impl IntoResponse {
+    match state.query_service.get_current_season().await {
+        Ok(Some(season)) => Json(season).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Current season not found".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn get_all_seasons_top1(State(state): State<AppState>) -> impl IntoResponse {
+    match state.query_service.get_all_seasons_top1().await {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 // ── Admin handlers ────────────────────────────────────────────────────────────
 
 pub async fn create_season(

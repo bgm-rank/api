@@ -121,3 +121,9 @@ pub struct DeletedResponse {
 pub struct RemovedResponse {
     pub removed: bool,
 }
+
+#[derive(Serialize)]
+pub struct SeasonTop1Item {
+    pub season_id: i32,
+    pub subject: PublicSubjectItem,
+}

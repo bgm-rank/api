@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use crate::api::schemas::{PublicSeasonResponse, PublicSubjectItem};
+use crate::api::schemas::{PublicSeasonResponse, PublicSubjectItem, SeasonTop1Item};
 use crate::core::sync::dedup_preserving_order;
 use crate::dal::{Database, SeasonRepository, SeasonSubjectRepository, SubjectRepository};
 
@@ -82,6 +82,98 @@ impl QueryService {
 
         Ok(Some(items))
     }
+
+    pub async fn get_current_season(&self) -> Result<Option<PublicSeasonResponse>> {
+        let season_id = current_season_id();
+        let pool = self.db.pool();
+        let season = SeasonRepository::new(pool).find_by_id(season_id).await?;
+        Ok(season.map(|s| PublicSeasonResponse {
+            season_id: s.season_id,
+            year: s.year,
+            season: s.season,
+            name: s.name,
+            updated_at: s.updated_at,
+        }))
+    }
+
+    pub async fn get_all_seasons_top1(&self) -> Result<Vec<SeasonTop1Item>> {
+        let pool = self.db.pool();
+
+        #[derive(sqlx::FromRow)]
+        struct Top1Row {
+            season_id: i32,
+            id: i32,
+            name: Option<String>,
+            name_cn: Option<String>,
+            images_grid: Option<String>,
+            images_large: Option<String>,
+            rank: Option<i32>,
+            score: Option<f64>,
+            collection_total: Option<i32>,
+            average_comment: Option<f64>,
+            drop_rate: Option<f64>,
+            air_weekday: Option<String>,
+            meta_tags: Vec<String>,
+            media_type: Option<String>,
+            rating: Option<String>,
+        }
+
+        let rows = sqlx::query_as::<_, Top1Row>(
+            r#"
+            SELECT DISTINCT ON (ss.season_id)
+                ss.season_id,
+                s.id, s.name, s.name_cn, s.images_grid, s.images_large,
+                s.rank, s.score, s.collection_total, s.average_comment,
+                s.drop_rate, s.air_weekday, s.meta_tags, s.media_type, s.rating
+            FROM season_subjects ss
+            JOIN subjects s ON ss.subject_id = s.id
+            ORDER BY ss.season_id DESC,
+                s.rank ASC NULLS LAST,
+                s.collection_total DESC NULLS LAST
+            "#,
+        )
+        .fetch_all(pool)
+        .await?;
+
+        let items = rows
+            .into_iter()
+            .map(|r| SeasonTop1Item {
+                season_id: r.season_id,
+                subject: PublicSubjectItem {
+                    id: r.id,
+                    name: r.name,
+                    name_cn: r.name_cn,
+                    images_grid: r.images_grid,
+                    images_large: r.images_large,
+                    rank: r.rank,
+                    score: r.score,
+                    collection_total: r.collection_total,
+                    average_comment: r.average_comment,
+                    drop_rate: r.drop_rate,
+                    air_weekday: r.air_weekday,
+                    meta_tags: dedup_preserving_order(r.meta_tags),
+                    media_type: r.media_type,
+                    rating: r.rating,
+                },
+            })
+            .collect();
+
+        Ok(items)
+    }
+}
+
+fn current_season_id() -> i32 {
+    use chrono::Datelike;
+    let now = chrono::Local::now();
+    let year = now.year();
+    let month = now.month();
+    let season_month = match month {
+        1..=3 => 1,
+        4..=6 => 4,
+        7..=9 => 7,
+        _ => 10,
+    };
+    year * 100 + season_month as i32
 }
 
 #[cfg(test)]

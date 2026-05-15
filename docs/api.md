@@ -63,6 +63,67 @@ Base URL (prod): `https://api.rinshankaiho.fun`
 
 ---
 
+### GET /api/seasons/current
+
+获取当前季度信息。当前季度由服务器系统时间推算：1–3 月→`01`，4–6 月→`04`，7–9 月→`07`，10–12 月→`10`。
+
+**响应 200**
+
+```json
+{
+  "season_id": 202604,
+  "year": 2026,
+  "season": "SPRING",
+  "name": "2026春",
+  "updated_at": "2026-05-10T08:00:00"
+}
+```
+
+字段说明同 `GET /api/seasons`。
+
+**响应 404** — 当前季度尚未录入数据库
+
+---
+
+### GET /api/seasons/top1
+
+获取所有季度各自排名第一的番剧，按 `season_id` 降序排列。
+
+选取规则：优先选该季度 `rank` 最小的番剧；若该季度所有番剧均无 `rank`，则选 `collection_total` 最多的。
+
+**响应 200**
+
+```json
+[
+  {
+    "season_id": 202604,
+    "subject": {
+      "id": 12345,
+      "name": "某番剧",
+      "name_cn": "某番剧（中文）",
+      "images_grid": "https://...",
+      "images_large": "https://...",
+      "rank": 1,
+      "score": 9.1,
+      "collection_total": 180000,
+      "average_comment": 4.2,
+      "drop_rate": 0.03,
+      "air_weekday": "星期五",
+      "meta_tags": ["TV", "奇幻"],
+      "media_type": "TV",
+      "rating": "G"
+    }
+  }
+]
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `season_id` | `number` | 季度 ID |
+| `subject` | `object` | 该季度第一名的番剧，字段同 `GET /api/seasons/{season_id}/subjects` 单项 |
+
+---
+
 ### GET /api/seasons/{season_id}/subjects
 
 获取指定季度的番剧列表，按 `rank` 升序排列（无 rank 的排在末尾）。

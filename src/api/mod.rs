@@ -17,7 +17,10 @@ use tower_http::{
 
 use crate::dal::Database;
 
-use endpoints::{AppState, admin_router, get_season_subjects, health_check, list_seasons};
+use endpoints::{
+    AppState, admin_router, get_all_seasons_top1, get_current_season, get_season_subjects,
+    health_check, list_seasons,
+};
 
 /// 构建带有完整中间件栈的应用 Router（从已有 AppState 构建）
 pub fn create_app_from_state(state: AppState) -> Router {
@@ -26,6 +29,8 @@ pub fn create_app_from_state(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/api/seasons", get(list_seasons))
+        .route("/api/seasons/current", get(get_current_season))
+        .route("/api/seasons/top1", get(get_all_seasons_top1))
         .route(
             "/api/seasons/{season_id}/subjects",
             get(get_season_subjects),
