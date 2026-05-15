@@ -103,7 +103,7 @@ Base URL (prod): `https://api.rinshankaiho.fun`
 | `name_cn` | `string \| null` | 中文名 |
 | `images_grid` | `string \| null` | 小图 URL（网格封面） |
 | `images_large` | `string \| null` | 大图 URL |
-| `rank` | `number \| null` | Bangumi 全站排名 |
+| `rank` | `number \| null` | Bangumi 全站排名，如果没有排名则返回999999 |
 | `score` | `number \| null` | 评分（精度约 4 位小数） |
 | `collection_total` | `number \| null` | 总收藏数 |
 | `average_comment` | `number \| null` | 平均吐槽数（由已播集数计算） |
