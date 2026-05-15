@@ -58,7 +58,7 @@ impl SyncService {
 
         self.sync_season_data(season_id, &key).await.map_err(|e| {
             // T017: sync failed log
-            tracing::error!(season_id = %season_id, error = %e, "sync failed");
+            tracing::error!(season_id = %season_id, error = %format!("{:#}", e), "sync failed");
             e
         })
     }
@@ -78,7 +78,7 @@ impl SyncService {
 
         self.sync_season_data(season_id, &key).await.map_err(|e| {
             // T017: sync failed log
-            tracing::error!(season_id = %season_id, error = %e, "sync failed");
+            tracing::error!(season_id = %season_id, error = %format!("{:#}", e), "sync failed");
             e
         })
     }

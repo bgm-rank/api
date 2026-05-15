@@ -75,6 +75,9 @@ impl SeasonDataClient {
             .get(self.url.as_str())
             .send()
             .await
+            .inspect_err(|e| {
+                tracing::warn!(url = %self.url, error = %e, "season data api call failed");
+            })
             .context("发送请求失败")?;
 
         if !response.status().is_success() {
