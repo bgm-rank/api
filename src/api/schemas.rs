@@ -49,15 +49,6 @@ pub struct CreateSeasonRequest {
     pub name: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct SyncResultResponse {
-    pub season_id: i32,
-    pub subjects_added: usize,
-    pub subjects_removed: usize,
-    pub subjects_updated: usize,
-    pub subjects_failed: usize,
-}
-
 // T039: 孤立番剧 schemas
 #[derive(Serialize)]
 pub struct OrphanSubjectItem {

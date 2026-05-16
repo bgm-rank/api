@@ -58,7 +58,7 @@ impl AdminService {
             }
         };
         for season in seasons {
-            match self.sync_service.resync(season.season_id).await {
+            match self.sync_service.resync(season.season_id, None).await {
                 Ok(result) => tracing::info!(
                     season_id = season.season_id,
                     added = result.added,

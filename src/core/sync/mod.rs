@@ -1,12 +1,19 @@
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use crate::dal::{CreateSeason, CreateSubject, Database};
 use crate::dal::{SeasonRepository, SeasonSubjectRepository, SubjectRepository};
 use crate::services::bangumi::schemas::{Collection, Episode, InfoboxItem};
 use crate::services::bangumi::{BangumiClient, Subject as BangumiSubject};
 use crate::services::season_data::{MediaType, Rating, SeasonDataClient};
+
+pub enum SyncProgressEvent {
+    Progress { total: usize, done: usize, subject_id: i32 },
+    Done { season_id: i32, added: usize, removed: usize, updated: usize, failed: usize },
+    Error { message: String },
+}
 
 #[derive(Debug)]
 pub struct SyncResult {
@@ -37,6 +44,7 @@ impl SyncService {
         year: i32,
         month: i32,
         name: Option<String>,
+        progress_tx: Option<mpsc::Sender<SyncProgressEvent>>,
     ) -> Result<SyncResult> {
         let season_id = year * 100 + month;
         // T015: sync started log
@@ -56,14 +64,18 @@ impl SyncService {
             .await
             .context("upsert season 失败")?;
 
-        self.sync_season_data(season_id, &key).await.map_err(|e| {
+        self.sync_season_data(season_id, &key, progress_tx).await.map_err(|e| {
             // T017: sync failed log
             tracing::error!(season_id = %season_id, error = %format!("{:#}", e), "sync failed");
             e
         })
     }
 
-    pub async fn resync(&self, season_id: i32) -> Result<SyncResult> {
+    pub async fn resync(
+        &self,
+        season_id: i32,
+        progress_tx: Option<mpsc::Sender<SyncProgressEvent>>,
+    ) -> Result<SyncResult> {
         // T015: sync started log
         tracing::info!(season_id = %season_id, operation = "resync", "sync started");
         let pool = self.db.pool();
@@ -76,14 +88,19 @@ impl SyncService {
         let season_str = month_to_season(month)?;
         let key = format!("{}-{}", season.year, season_str.to_lowercase());
 
-        self.sync_season_data(season_id, &key).await.map_err(|e| {
+        self.sync_season_data(season_id, &key, progress_tx).await.map_err(|e| {
             // T017: sync failed log
             tracing::error!(season_id = %season_id, error = %format!("{:#}", e), "sync failed");
             e
         })
     }
 
-    async fn sync_season_data(&self, season_id: i32, key: &str) -> Result<SyncResult> {
+    async fn sync_season_data(
+        &self,
+        season_id: i32,
+        key: &str,
+        progress_tx: Option<mpsc::Sender<SyncProgressEvent>>,
+    ) -> Result<SyncResult> {
         let start = std::time::Instant::now();
         let pool = self.db.pool();
 
@@ -115,6 +132,8 @@ impl SyncService {
         let mut updated = 0usize;
         let mut failed = 0usize;
         let today = chrono::Utc::now().date_naive();
+        let total = entries.len();
+        let mut done = 0usize;
 
         for entry in &entries {
             let avg_comment = match self
@@ -146,6 +165,10 @@ impl SyncService {
                     failed += 1;
                 }
             }
+            done += 1;
+            if let Some(tx) = &progress_tx {
+                let _ = tx.send(SyncProgressEvent::Progress { total, done, subject_id: entry.bgm_id }).await;
+            }
         }
 
         // 更新 season 的 updated_at 时间戳
@@ -154,6 +177,10 @@ impl SyncService {
             .await
         {
             tracing::warn!(season_id = %season_id, error = %e, "touch_updated_at 失败");
+        }
+
+        if let Some(tx) = &progress_tx {
+            let _ = tx.send(SyncProgressEvent::Done { season_id, added, removed, updated, failed }).await;
         }
 
         // T016: sync completed log
@@ -490,7 +517,7 @@ mod tests {
         let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
         // month=2 无效，但 sync started 日志应在 month_to_season 之前触发
-        let _ = svc.create_and_sync(2026, 2, None).await;
+        let _ = svc.create_and_sync(2026, 2, None, None).await;
         assert!(
             logs_contain("season_id"),
             "sync started 日志应包含 season_id 字段"
@@ -507,7 +534,7 @@ mod tests {
     async fn test_sync_completed_log_has_result_fields(pool: PgPool) {
         let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
-        let result = svc.create_and_sync(2999, 1, None).await;
+        let result = svc.create_and_sync(2999, 1, None, None).await;
         if result.is_ok() {
             assert!(
                 logs_contain("added"),
@@ -525,7 +552,7 @@ mod tests {
     async fn test_create_and_sync_invalid_month_returns_err(pool: PgPool) {
         let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
-        let result = svc.create_and_sync(2026, 2, None).await;
+        let result = svc.create_and_sync(2026, 2, None, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid month"));
     }
@@ -534,7 +561,7 @@ mod tests {
     async fn test_resync_unknown_season_returns_err(pool: PgPool) {
         let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
-        let result = svc.resync(999999).await;
+        let result = svc.resync(999999, None).await;
         assert!(result.is_err());
     }
 

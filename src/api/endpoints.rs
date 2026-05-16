@@ -3,22 +3,27 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     middleware,
-    response::IntoResponse,
+    response::{IntoResponse, sse::{Event, KeepAlive, Sse}},
 };
 use serde::Serialize;
+use std::convert::Infallible;
 use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::core::AdminService;
 use crate::core::SyncService;
 use crate::core::query::QueryService;
 use crate::core::scheduler::SchedulerHandle;
+use crate::core::sync::SyncProgressEvent;
 use crate::dal::Database;
 
 use super::middleware::require_admin_token;
 use super::schemas::{
     AcceptedResponse, CreateSeasonRequest, DeleteOrphansResponse, DeleteSeasonResponse,
     DeletedResponse, EditSeasonRequest, EditSubjectRequest, ErrorResponse, OrphanSubjectItem,
-    RemovedResponse, SchedulerStatusResponse, SyncResultResponse,
+    RemovedResponse, SchedulerStatusResponse,
 };
 
 #[derive(Serialize)]
@@ -135,6 +140,25 @@ pub async fn get_all_seasons_top1(State(state): State<AppState>) -> impl IntoRes
 
 // ── Admin handlers ────────────────────────────────────────────────────────────
 
+fn progress_to_sse_stream(
+    rx: mpsc::Receiver<SyncProgressEvent>,
+) -> impl tokio_stream::Stream<Item = Result<Event, Infallible>> {
+    ReceiverStream::new(rx).map(|event| {
+        let data = match event {
+            SyncProgressEvent::Progress { total, done, subject_id } => {
+                serde_json::json!({ "type": "progress", "total": total, "done": done, "subject_id": subject_id })
+            }
+            SyncProgressEvent::Done { season_id, added, removed, updated, failed } => {
+                serde_json::json!({ "type": "done", "season_id": season_id, "added": added, "removed": removed, "updated": updated, "failed": failed })
+            }
+            SyncProgressEvent::Error { message } => {
+                serde_json::json!({ "type": "error", "message": message })
+            }
+        };
+        Ok::<Event, Infallible>(Event::default().data(data.to_string()))
+    })
+}
+
 pub async fn create_season(
     State(state): State<AppState>,
     Json(req): Json<CreateSeasonRequest>,
@@ -149,53 +173,35 @@ pub async fn create_season(
             .into_response();
     }
 
-    match state
-        .sync_service
-        .create_and_sync(req.year, req.month, req.name)
-        .await
-    {
-        Ok(result) => (
-            StatusCode::CREATED,
-            Json(SyncResultResponse {
-                season_id: result.season_id,
-                subjects_added: result.added,
-                subjects_removed: result.removed,
-                subjects_updated: result.updated,
-                subjects_failed: result.failed,
-            }),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
-    }
+    let (tx, rx) = mpsc::channel::<SyncProgressEvent>(64);
+    let svc = Arc::clone(&state.sync_service);
+    let (year, month, name) = (req.year, req.month, req.name);
+
+    tokio::spawn(async move {
+        if let Err(e) = svc.create_and_sync(year, month, name, Some(tx.clone())).await {
+            let _ = tx.send(SyncProgressEvent::Error { message: e.to_string() }).await;
+        }
+    });
+
+    Sse::new(progress_to_sse_stream(rx))
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 pub async fn sync_season(
     State(state): State<AppState>,
     Path(season_id): Path<i32>,
-) -> impl IntoResponse {
-    match state.sync_service.resync(season_id).await {
-        Ok(result) => Json(SyncResultResponse {
-            season_id: result.season_id,
-            subjects_added: result.added,
-            subjects_removed: result.removed,
-            subjects_updated: result.updated,
-            subjects_failed: result.failed,
-        })
-        .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
-    }
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let (tx, rx) = mpsc::channel::<SyncProgressEvent>(64);
+    let svc = Arc::clone(&state.sync_service);
+
+    tokio::spawn(async move {
+        if let Err(e) = svc.resync(season_id, Some(tx.clone())).await {
+            let _ = tx.send(SyncProgressEvent::Error { message: e.to_string() }).await;
+        }
+    });
+
+    Sse::new(progress_to_sse_stream(rx)).keep_alive(KeepAlive::default())
 }
 
 pub async fn list_orphan_subjects(State(state): State<AppState>) -> impl IntoResponse {
@@ -648,7 +654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sync_season_unknown_id_returns_500() {
+    async fn test_sync_season_unknown_id_returns_sse_error() {
         let app = admin_router(AppState::new(test_db().await));
         let resp = app
             .oneshot(
@@ -661,7 +667,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("\"type\":\"error\""), "expected SSE error event, got: {body_str}");
     }
 
     // T040 — GET /admin/subjects/orphans
