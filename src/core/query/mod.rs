@@ -71,7 +71,7 @@ impl QueryService {
                 rank: s.rank,
                 score: s.score,
                 collection_total: s.collection_total,
-                average_comment: s.average_comment,
+                average_comment: s.average_comment.unwrap_or(0.0),
                 drop_rate: s.drop_rate,
                 air_weekday: s.air_weekday,
                 meta_tags: dedup_preserving_order(s.meta_tags),
@@ -148,7 +148,7 @@ impl QueryService {
                     rank: r.rank,
                     score: r.score,
                     collection_total: r.collection_total,
-                    average_comment: r.average_comment,
+                    average_comment: r.average_comment.unwrap_or(0.0),
                     drop_rate: r.drop_rate,
                     air_weekday: r.air_weekday,
                     meta_tags: dedup_preserving_order(r.meta_tags),
@@ -478,7 +478,7 @@ mod tests {
             .await?;
         let svc = QueryService::new(db);
         let items = svc.get_season_subjects(202601).await.unwrap().unwrap();
-        let avg = items[0].average_comment.unwrap();
+        let avg = items[0].average_comment;
         assert!((avg - 3.5).abs() < 0.0001, "expected 3.5, got {avg}");
         Ok(())
     }

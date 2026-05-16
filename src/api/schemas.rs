@@ -33,7 +33,7 @@ pub struct PublicSubjectItem {
     pub rank: Option<i32>,
     pub score: Option<f64>,
     pub collection_total: Option<i32>,
-    pub average_comment: Option<f64>,
+    pub average_comment: f64,
     pub drop_rate: Option<f64>,
     pub air_weekday: Option<String>,
     pub meta_tags: Vec<String>,
