@@ -185,12 +185,13 @@ impl SchedulerService {
             let wait = (next - now).to_std().unwrap_or(Duration::from_secs(0));
             let sleep_future = sleep_until(Instant::now() + wait);
 
-            tokio::select! {
-                _ = sleep_future => {},
+            let is_manual = tokio::select! {
+                _ = sleep_future => false,
                 _ = self.handle.manual_trigger.notified() => {
                     tracing::info!("调度器被手动触发");
+                    true
                 }
-            }
+            };
 
             tick_count += 1;
 
@@ -205,6 +206,7 @@ impl SchedulerService {
                 &self.deploy_hook_client,
                 &self.handle,
                 tick_count,
+                !is_manual,
             )
             .await;
         }
@@ -217,6 +219,7 @@ pub(super) async fn run_tick(
     deploy_hook_client: &DeployHookClient,
     handle: &SchedulerHandle,
     tick_count: u64,
+    trigger_deploy: bool,
 ) -> TickStats {
     use crate::dal::SubjectRepository;
     use tokio::time::{Duration, sleep};
@@ -291,7 +294,7 @@ pub(super) async fn run_tick(
         tracing::warn!(current_season_id, error = %e, "调度器 touch_updated_at 失败");
     }
 
-    if stats.success_count > 0
+    if trigger_deploy && stats.success_count > 0
         && let Err(e) = deploy_hook_client.trigger().await
     {
         tracing::error!(error = %e, "Deploy Hook 触发失败");
