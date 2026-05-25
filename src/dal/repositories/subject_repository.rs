@@ -1,5 +1,5 @@
 use crate::dal::dto::{CreateSubject, Subject, UpdateSubject};
-use sqlx::PgPool;
+use sqlx::SqlitePool;
 
 fn log_db_error(operation: &'static str, table: &'static str, e: &sqlx::Error) {
     match e {
@@ -16,23 +16,24 @@ fn log_db_error(operation: &'static str, table: &'static str, e: &sqlx::Error) {
 }
 
 pub struct SubjectRepository<'a> {
-    pool: &'a PgPool,
+    pool: &'a SqlitePool,
 }
 
 #[allow(dead_code)]
 impl<'a> SubjectRepository<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a SqlitePool) -> Self {
         Self { pool }
     }
 
     pub async fn create(&self, subject: CreateSubject) -> Result<Subject, sqlx::Error> {
+        let meta_tags_json = serde_json::to_string(&subject.meta_tags).unwrap_or_default();
         let row = sqlx::query_as::<_, Subject>(
             r#"
             INSERT INTO subjects (
                 id, name, name_cn, images_grid, images_large,
                 rank, score, collection_total, average_comment,
                 drop_rate, air_weekday, meta_tags, media_type, rating)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING *
             "#,
         )
@@ -47,7 +48,7 @@ impl<'a> SubjectRepository<'a> {
         .bind(subject.average_comment)
         .bind(subject.drop_rate)
         .bind(subject.air_weekday)
-        .bind(subject.meta_tags)
+        .bind(meta_tags_json)
         .bind(subject.media_type)
         .bind(subject.rating)
         .fetch_one(self.pool)
@@ -57,6 +58,7 @@ impl<'a> SubjectRepository<'a> {
     }
 
     pub async fn upsert(&self, subject: CreateSubject) -> Result<Subject, sqlx::Error> {
+        let meta_tags_json = serde_json::to_string(&subject.meta_tags).unwrap_or_default();
         let row = sqlx::query_as::<_, Subject>(
             r#"
             INSERT INTO subjects (
@@ -64,7 +66,7 @@ impl<'a> SubjectRepository<'a> {
                 rank, score, collection_total, average_comment,
                 drop_rate, air_weekday, meta_tags, media_type, rating
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (id) DO UPDATE SET
                 name = EXCLUDED.name,
                 name_cn = EXCLUDED.name_cn,
@@ -76,10 +78,10 @@ impl<'a> SubjectRepository<'a> {
                 average_comment = EXCLUDED.average_comment,
                 drop_rate = EXCLUDED.drop_rate,
                 air_weekday = EXCLUDED.air_weekday,
-                meta_tags = CASE WHEN cardinality(EXCLUDED.meta_tags) > 0 THEN EXCLUDED.meta_tags ELSE subjects.meta_tags END,
+                meta_tags = CASE WHEN json_array_length(EXCLUDED.meta_tags) > 0 THEN EXCLUDED.meta_tags ELSE subjects.meta_tags END,
                 media_type = COALESCE(EXCLUDED.media_type, subjects.media_type),
                 rating = COALESCE(EXCLUDED.rating, subjects.rating),
-                updated_at = CURRENT_TIMESTAMP
+                updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
             RETURNING *
             "#,
         )
@@ -94,7 +96,7 @@ impl<'a> SubjectRepository<'a> {
         .bind(subject.average_comment)
         .bind(subject.drop_rate)
         .bind(subject.air_weekday)
-        .bind(subject.meta_tags)
+        .bind(meta_tags_json)
         .bind(subject.media_type)
         .bind(subject.rating)
         .fetch_one(self.pool)
@@ -135,7 +137,9 @@ impl<'a> SubjectRepository<'a> {
     }
 
     pub async fn update_last_updated_at(&self, subject_id: i32) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE subjects SET last_updated_at = NOW() WHERE id = $1")
+        let now = chrono::Utc::now();
+        sqlx::query("UPDATE subjects SET last_updated_at = ? WHERE id = ?")
+            .bind(now)
             .bind(subject_id)
             .execute(self.pool)
             .await?;
@@ -180,10 +184,13 @@ impl<'a> SubjectRepository<'a> {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let rows = sqlx::query_as::<_, Subject>("SELECT * FROM subjects WHERE id = ANY($1)")
-            .bind(ids)
-            .fetch_all(self.pool)
-            .await?;
+        let ids_json = serde_json::to_string(ids).unwrap_or_default();
+        let rows = sqlx::query_as::<_, Subject>(
+            "SELECT * FROM subjects WHERE id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(ids_json)
+        .fetch_all(self.pool)
+        .await?;
 
         Ok(rows)
     }
@@ -192,7 +199,7 @@ impl<'a> SubjectRepository<'a> {
         let row = sqlx::query_as::<_, Subject>(
             r#"
             SELECT * FROM subjects
-            WHERE id = $1
+            WHERE id = ?
             "#,
         )
         .bind(subject_id)
@@ -207,26 +214,29 @@ impl<'a> SubjectRepository<'a> {
         subject_id: i32,
         subject: UpdateSubject,
     ) -> Result<Subject, sqlx::Error> {
+        let meta_tags_json = subject
+            .meta_tags
+            .as_ref()
+            .map(|t| serde_json::to_string(t).unwrap_or_default());
         let row = sqlx::query_as(
             r#"
             UPDATE subjects
             SET
-                name = COALESCE($2, name),
-                name_cn = COALESCE($3, name_cn),
-                images_grid = COALESCE($4, images_grid),
-                images_large = COALESCE($5, images_large),
-                rank = COALESCE($6, rank),
-                score = COALESCE($7, score),
-                collection_total = COALESCE($8, collection_total),
-                average_comment = COALESCE($9, average_comment),
-                drop_rate = COALESCE($10, drop_rate),
-                air_weekday = COALESCE($11, air_weekday),
-                meta_tags = COALESCE($12, meta_tags)
-            WHERE id = $1
+                name = COALESCE(?, name),
+                name_cn = COALESCE(?, name_cn),
+                images_grid = COALESCE(?, images_grid),
+                images_large = COALESCE(?, images_large),
+                rank = COALESCE(?, rank),
+                score = COALESCE(?, score),
+                collection_total = COALESCE(?, collection_total),
+                average_comment = COALESCE(?, average_comment),
+                drop_rate = COALESCE(?, drop_rate),
+                air_weekday = COALESCE(?, air_weekday),
+                meta_tags = COALESCE(?, meta_tags)
+            WHERE id = ?
             RETURNING *
             "#,
         )
-        .bind(subject_id)
         .bind(subject.name)
         .bind(subject.name_cn)
         .bind(subject.images_grid)
@@ -237,7 +247,8 @@ impl<'a> SubjectRepository<'a> {
         .bind(subject.average_comment)
         .bind(subject.drop_rate)
         .bind(subject.air_weekday)
-        .bind(subject.meta_tags)
+        .bind(meta_tags_json)
+        .bind(subject_id)
         .fetch_one(self.pool)
         .await?;
 
@@ -247,7 +258,7 @@ impl<'a> SubjectRepository<'a> {
     pub async fn delete(&self, subject_id: i32) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             r#"
-            DELETE FROM subjects WHERE id = $1
+            DELETE FROM subjects WHERE id = ?
             "#,
         )
         .bind(subject_id)
@@ -262,9 +273,8 @@ impl<'a> SubjectRepository<'a> {
 mod tests {
     use super::*;
 
-    // T033/T034 — find_orphans
     #[sqlx::test]
-    async fn test_find_orphans(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_find_orphans(pool: SqlitePool) -> sqlx::Result<()> {
         use crate::dal::dto::{CreateSeason, CreateSeasonSubject};
         use crate::dal::repositories::SeasonRepository;
         use crate::dal::repositories::SeasonSubjectRepository;
@@ -279,7 +289,6 @@ mod tests {
             .await?;
 
         let repo = SubjectRepository::new(&pool);
-        // Associated subjects (not orphans)
         repo.create(CreateSubject {
             id: 1,
             ..Default::default()
@@ -303,7 +312,6 @@ mod tests {
             })
             .await?;
 
-        // Orphans
         repo.create(CreateSubject {
             id: 10,
             ..Default::default()
@@ -329,9 +337,8 @@ mod tests {
         Ok(())
     }
 
-    // T035/T036 — delete_orphans
     #[sqlx::test]
-    async fn test_delete_orphans(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_delete_orphans(pool: SqlitePool) -> sqlx::Result<()> {
         use crate::dal::dto::{CreateSeason, CreateSeasonSubject};
         use crate::dal::repositories::SeasonRepository;
         use crate::dal::repositories::SeasonSubjectRepository;
@@ -376,14 +383,12 @@ mod tests {
         Ok(())
     }
 
-    // T026/T027 — find_due_for_update
     #[sqlx::test]
-    async fn test_find_due_for_update(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_find_due_for_update(pool: SqlitePool) -> sqlx::Result<()> {
         use crate::dal::dto::{CreateSeason, CreateSeasonSubject};
         use crate::dal::repositories::SeasonRepository;
         use crate::dal::repositories::SeasonSubjectRepository;
 
-        // Setup: current season 202601, past season 202504
         SeasonRepository::new(&pool)
             .create(CreateSeason {
                 season_id: 202601,
@@ -403,7 +408,6 @@ mod tests {
 
         let repo = SubjectRepository::new(&pool);
 
-        // Subject 1: current season → always due
         repo.create(CreateSubject {
             id: 1,
             ..Default::default()
@@ -416,7 +420,6 @@ mod tests {
             })
             .await?;
 
-        // Subject 2: past season (age=3), last_updated_at = 4 days ago → due
         repo.create(CreateSubject {
             id: 2,
             ..Default::default()
@@ -428,11 +431,13 @@ mod tests {
                 subject_id: 2,
             })
             .await?;
-        sqlx::query("UPDATE subjects SET last_updated_at = NOW() - INTERVAL '4 days' WHERE id = 2")
-            .execute(&pool)
-            .await?;
+        sqlx::query(
+            "UPDATE subjects SET last_updated_at = datetime('now', '-4 days') WHERE id = ?",
+        )
+        .bind(2)
+        .execute(&pool)
+        .await?;
 
-        // Subject 3: past season (age=3), last_updated_at = 1 day ago → NOT due
         repo.create(CreateSubject {
             id: 3,
             ..Default::default()
@@ -444,17 +449,13 @@ mod tests {
                 subject_id: 3,
             })
             .await?;
-        sqlx::query("UPDATE subjects SET last_updated_at = NOW() - INTERVAL '1 day' WHERE id = 3")
-            .execute(&pool)
-            .await?;
+        sqlx::query(
+            "UPDATE subjects SET last_updated_at = datetime('now', '-1 day') WHERE id = ?",
+        )
+        .bind(3)
+        .execute(&pool)
+        .await?;
 
-        // current_season_id is 202510 (autumn 2025) → distance from 202504=3, from 202601=-3
-        // Wait, let me reconsider. current_season_id=202510 means:
-        // Subject 1 (season 202601): quarters_distance(202601, 202510) = -3 (past) but we pass current as 202601
-        // Let me use current_season_id = 202601:
-        // Subject 1 (202601): age=0 → always due
-        // Subject 2 (202504): age = quarters_distance(202504, 202601) = 3 → need 3 days → 4 days → DUE
-        // Subject 3 (202504): age=3 → 1 day → NOT DUE
         let due = repo.find_due_for_update(202601).await?;
         let due_ids: Vec<i32> = due.iter().map(|(id, _, _)| *id).collect();
 
@@ -468,9 +469,8 @@ mod tests {
         Ok(())
     }
 
-    // T028/T029 — update_last_updated_at
     #[sqlx::test]
-    async fn test_update_last_updated_at(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_update_last_updated_at(pool: SqlitePool) -> sqlx::Result<()> {
         let repo = SubjectRepository::new(&pool);
         repo.create(CreateSubject {
             id: 999,
@@ -490,7 +490,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_create_subject(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_create_subject(pool: SqlitePool) -> sqlx::Result<()> {
         let repo = SubjectRepository::new(&pool);
 
         let create_subject = CreateSubject {
@@ -528,7 +528,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_upsert_subject(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_upsert_subject(pool: SqlitePool) -> sqlx::Result<()> {
         let repo = SubjectRepository::new(&pool);
 
         let create_subject = CreateSubject {
@@ -596,7 +596,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_find_subject_by_id(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_find_subject_by_id(pool: SqlitePool) -> sqlx::Result<()> {
         let repo = SubjectRepository::new(&pool);
 
         let create_subject = CreateSubject {
@@ -641,7 +641,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_update_subject(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_update_subject(pool: SqlitePool) -> sqlx::Result<()> {
         let repo = SubjectRepository::new(&pool);
 
         let create_subject = CreateSubject {
@@ -695,9 +695,8 @@ mod tests {
         Ok(())
     }
 
-    // T001 — score FLOAT8 精度往返测试
     #[sqlx::test]
-    async fn test_score_float_precision_survives_roundtrip(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_score_float_precision_survives_roundtrip(pool: SqlitePool) -> sqlx::Result<()> {
         let repo = SubjectRepository::new(&pool);
 
         let score = 8.123456f64;
@@ -719,7 +718,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_delete_subject(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_delete_subject(pool: SqlitePool) -> sqlx::Result<()> {
         let repo = SubjectRepository::new(&pool);
 
         let create_subject = CreateSubject {

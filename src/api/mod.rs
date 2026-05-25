@@ -84,14 +84,14 @@ mod tests {
     use std::sync::Arc;
 
     use axum::{body::Body, http::Request};
-    use sqlx::PgPool;
+    use sqlx::SqlitePool;
     use tower::ServiceExt;
 
     use crate::dal::Database;
 
     // T006 [US1]: 发送 HTTP 请求，断言响应包含 x-request-id header
     #[sqlx::test]
-    async fn test_response_has_request_id_header(pool: PgPool) {
+    async fn test_response_has_request_id_header(pool: SqlitePool) {
         let db = Arc::new(Database::from_pool(pool));
         let app = super::create_app(db);
 

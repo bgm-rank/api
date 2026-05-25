@@ -1,5 +1,5 @@
 use crate::dal::dto::{CreateSeasonSubject, SeasonSubject, Subject};
-use sqlx::PgPool;
+use sqlx::SqlitePool;
 
 fn log_db_error(operation: &'static str, table: &'static str, e: &sqlx::Error) {
     match e {
@@ -16,12 +16,12 @@ fn log_db_error(operation: &'static str, table: &'static str, e: &sqlx::Error) {
 }
 
 pub struct SeasonSubjectRepository<'a> {
-    pool: &'a PgPool,
+    pool: &'a SqlitePool,
 }
 
 #[allow(dead_code)]
 impl<'a> SeasonSubjectRepository<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a SqlitePool) -> Self {
         Self { pool }
     }
 
@@ -32,7 +32,7 @@ impl<'a> SeasonSubjectRepository<'a> {
         let row = sqlx::query_as::<_, SeasonSubject>(
             r#"
             INSERT INTO season_subjects (season_id, subject_id)
-            VALUES ($1, $2)
+            VALUES (?, ?)
             RETURNING season_id, subject_id, added_at
             "#,
         )
@@ -51,7 +51,7 @@ impl<'a> SeasonSubjectRepository<'a> {
         sqlx::query(
             r#"
             INSERT INTO season_subjects (season_id, subject_id)
-            VALUES ($1, $2)
+            VALUES (?, ?)
             ON CONFLICT (season_id, subject_id) DO NOTHING
             "#,
         )
@@ -88,7 +88,7 @@ impl<'a> SeasonSubjectRepository<'a> {
 
         for subject_id in &to_add {
             sqlx::query(
-                "INSERT INTO season_subjects (season_id, subject_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                "INSERT INTO season_subjects (season_id, subject_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
             )
             .bind(season_id)
             .bind(subject_id)
@@ -98,11 +98,12 @@ impl<'a> SeasonSubjectRepository<'a> {
         }
 
         if !to_remove.is_empty() {
+            let ids_json = serde_json::to_string(&to_remove).unwrap_or_default();
             sqlx::query(
-                "DELETE FROM season_subjects WHERE season_id = $1 AND subject_id = ANY($2)",
+                "DELETE FROM season_subjects WHERE season_id = ? AND subject_id IN (SELECT value FROM json_each(?))",
             )
             .bind(season_id)
-            .bind(&to_remove)
+            .bind(ids_json)
             .execute(&mut *tx)
             .await
             .inspect_err(|e| log_db_error("reconcile_delete", "season_subjects", e))?;
@@ -116,7 +117,7 @@ impl<'a> SeasonSubjectRepository<'a> {
 
     pub async fn find_by_season_id(&self, season_id: i32) -> Result<Vec<i32>, sqlx::Error> {
         let ids = sqlx::query_scalar::<_, i32>(
-            "SELECT subject_id FROM season_subjects WHERE season_id = $1",
+            "SELECT subject_id FROM season_subjects WHERE season_id = ?",
         )
         .bind(season_id)
         .fetch_all(self.pool)
@@ -131,7 +132,7 @@ impl<'a> SeasonSubjectRepository<'a> {
             SELECT s.*
             FROM subjects s
             JOIN season_subjects ss ON s.id = ss.subject_id
-            WHERE ss.season_id = $1
+            WHERE ss.season_id = ?
             ORDER BY s.rank ASC, s.collection_total DESC
             "#,
         )
@@ -148,7 +149,7 @@ impl<'a> SeasonSubjectRepository<'a> {
         subject_id: i32,
     ) -> Result<bool, sqlx::Error> {
         let result =
-            sqlx::query("DELETE FROM season_subjects WHERE season_id = $1 AND subject_id = $2")
+            sqlx::query("DELETE FROM season_subjects WHERE season_id = ? AND subject_id = ?")
                 .bind(season_id)
                 .bind(subject_id)
                 .execute(self.pool)
@@ -163,20 +164,20 @@ impl<'a> SeasonSubjectRepository<'a> {
     ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query("DELETE FROM season_subjects WHERE season_id = $1 AND subject_id = $2")
+        sqlx::query("DELETE FROM season_subjects WHERE season_id = ? AND subject_id = ?")
             .bind(season_id)
             .bind(subject_id)
             .execute(&mut *tx)
             .await?;
 
         let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM season_subjects WHERE subject_id = $1")
+            sqlx::query_scalar("SELECT COUNT(*) FROM season_subjects WHERE subject_id = ?")
                 .bind(subject_id)
                 .fetch_one(&mut *tx)
                 .await?;
 
         if count == 0 {
-            sqlx::query("DELETE FROM subjects WHERE id = $1")
+            sqlx::query("DELETE FROM subjects WHERE id = ?")
                 .bind(subject_id)
                 .execute(&mut *tx)
                 .await?;
@@ -193,7 +194,7 @@ mod tests {
     use crate::dal::dto::{CreateSeason, CreateSubject};
     use crate::dal::repositories::{SeasonRepository, SubjectRepository};
 
-    async fn create_test_season(pool: &PgPool) -> sqlx::Result<()> {
+    async fn create_test_season(pool: &SqlitePool) -> sqlx::Result<()> {
         let repo = SeasonRepository::new(&pool);
 
         let create_season = CreateSeason {
@@ -208,7 +209,7 @@ mod tests {
         Ok(())
     }
 
-    async fn create_test_subjects(pool: &PgPool) -> sqlx::Result<()> {
+    async fn create_test_subjects(pool: &SqlitePool) -> sqlx::Result<()> {
         let repo = SubjectRepository::new(pool);
 
         let create_subjects = vec![
@@ -319,15 +320,13 @@ mod tests {
         Ok(())
     }
 
-    // T014 🔴 reconcile 红灯测试
     #[sqlx::test]
-    async fn test_reconcile(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_reconcile(pool: SqlitePool) -> sqlx::Result<()> {
         create_test_season(&pool).await?;
         create_test_subjects(&pool).await?;
 
         let repo = SeasonSubjectRepository::new(&pool);
 
-        // 初始关联：A=443106, B=515759, C=517057
         for sid in [443106, 515759, 517057] {
             repo.create(CreateSeasonSubject {
                 season_id: 202601,
@@ -336,7 +335,6 @@ mod tests {
             .await?;
         }
 
-        // reconcile: 保留 B/C, 添加 D=548818, 删除 A=443106
         let (added, removed) = repo.reconcile(202601, vec![515759, 517057, 548818]).await?;
 
         assert_eq!(added, 1);
@@ -351,9 +349,8 @@ mod tests {
         Ok(())
     }
 
-    // T006 🔴 find_by_season_id 红灯测试
     #[sqlx::test]
-    async fn test_find_by_season_id(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_find_by_season_id(pool: SqlitePool) -> sqlx::Result<()> {
         create_test_season(&pool).await?;
         create_test_subjects(&pool).await?;
 
@@ -380,7 +377,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_create_season_subject(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_create_season_subject(pool: SqlitePool) -> sqlx::Result<()> {
         create_test_season(&pool).await?;
         create_test_subjects(&pool).await?;
 
@@ -400,7 +397,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_find_all_subjects_by_season_id(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_find_all_subjects_by_season_id(pool: SqlitePool) -> sqlx::Result<()> {
         create_test_season(&pool).await?;
         create_test_subjects(&pool).await?;
 
@@ -433,7 +430,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_insert_or_ignore(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_insert_or_ignore(pool: SqlitePool) -> sqlx::Result<()> {
         create_test_season(&pool).await?;
         create_test_subjects(&pool).await?;
 
@@ -444,17 +441,14 @@ mod tests {
             subject_id: 515759,
         };
 
-        // 第一次插入成功
         repo.insert_or_ignore(entry).await?;
 
-        // 重复插入不报错
         let entry = CreateSeasonSubject {
             season_id: 202601,
             subject_id: 515759,
         };
         repo.insert_or_ignore(entry).await?;
 
-        // 确认只有一条记录
         let subjects = repo.find_by_season(202601).await?;
         assert_eq!(subjects.len(), 1);
 
@@ -462,7 +456,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_delete_and_cleanup(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_delete_and_cleanup(pool: SqlitePool) -> sqlx::Result<()> {
         create_test_season(&pool).await?;
         create_test_subjects(&pool).await?;
 

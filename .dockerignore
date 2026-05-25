@@ -3,3 +3,6 @@ target/
 .git/
 docs/
 *.md
+bgm_rank.db
+bgm_rank.db-shm
+bgm_rank.db-wal

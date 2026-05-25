@@ -382,7 +382,7 @@ pub(crate) fn to_create_subject(s: BangumiSubject, avg_comment: Option<f64>) -> 
 mod tests {
     use super::*;
     use crate::services::bangumi::schemas::{Collection, InfoboxItem, Rating};
-    use sqlx::PgPool;
+    use sqlx::SqlitePool;
     use std::collections::HashMap;
 
     fn make_bgm_subject(rank: Option<i32>, count: HashMap<String, i32>) -> BangumiSubject {
@@ -513,7 +513,7 @@ mod tests {
     // T012 [US2]: 验证同步开始时 INFO 事件包含 season_id 和 operation 字段
     #[tracing_test::traced_test]
     #[sqlx::test]
-    async fn test_sync_started_log_has_season_id_and_operation(pool: PgPool) {
+    async fn test_sync_started_log_has_season_id_and_operation(pool: SqlitePool) {
         let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
         // month=2 无效，但 sync started 日志应在 month_to_season 之前触发
@@ -531,7 +531,7 @@ mod tests {
     // T013 [US2]: 验证同步完成时 INFO 事件包含 added, updated, deleted, failed, elapsed_ms 字段
     #[tracing_test::traced_test]
     #[sqlx::test]
-    async fn test_sync_completed_log_has_result_fields(pool: PgPool) {
+    async fn test_sync_completed_log_has_result_fields(pool: SqlitePool) {
         let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
         let result = svc.create_and_sync(2999, 1, None, None).await;
@@ -549,7 +549,7 @@ mod tests {
 
     // T019 — SyncService::create_and_sync / resync
     #[sqlx::test]
-    async fn test_create_and_sync_invalid_month_returns_err(pool: PgPool) {
+    async fn test_create_and_sync_invalid_month_returns_err(pool: SqlitePool) {
         let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
         let result = svc.create_and_sync(2026, 2, None, None).await;
@@ -558,7 +558,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_resync_unknown_season_returns_err(pool: PgPool) {
+    async fn test_resync_unknown_season_returns_err(pool: SqlitePool) {
         let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
         let result = svc.resync(999999, None).await;
@@ -567,7 +567,7 @@ mod tests {
 
     // T037 — SyncService::find_orphans / delete_orphans
     #[sqlx::test]
-    async fn test_find_orphans_returns_ok(pool: PgPool) {
+    async fn test_find_orphans_returns_ok(pool: SqlitePool) {
         let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
         let result = svc.find_orphans().await;
@@ -575,7 +575,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_delete_orphans_returns_ok(pool: PgPool) {
+    async fn test_delete_orphans_returns_ok(pool: SqlitePool) {
         let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
         let result = svc.delete_orphans().await;
@@ -620,7 +620,7 @@ mod tests {
 
     // T011 — delete_season（Red 阶段）
     #[sqlx::test]
-    async fn test_delete_season_existing_returns_true(pool: PgPool) {
+    async fn test_delete_season_existing_returns_true(pool: SqlitePool) {
         let db = Arc::new(Database::from_pool(pool));
 
         // 创建 season 202699
@@ -648,7 +648,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_delete_season_nonexistent_returns_false(pool: PgPool) {
+    async fn test_delete_season_nonexistent_returns_false(pool: SqlitePool) {
         let db = Arc::new(Database::from_pool(pool));
         let svc = SyncService::new(db);
         let result = svc.delete_season(999989).await;
@@ -840,7 +840,7 @@ mod tests {
     // T033 — sync_season_data 完成后 touch_updated_at 机制端到端验证
     // 通过 QueryService::list_seasons 验证 Service 层字段透传
     #[sqlx::test]
-    async fn test_sync_season_data_updates_season_updated_at(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_sync_season_data_updates_season_updated_at(pool: SqlitePool) -> sqlx::Result<()> {
         let db = Arc::new(Database::from_pool(pool.clone()));
         let season_repo = SeasonRepository::new(&pool);
         let query_svc = crate::core::query::QueryService::new(db);

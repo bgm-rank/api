@@ -71,11 +71,11 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use sqlx::PgPool;
+    use sqlx::SqlitePool;
     use tower::ServiceExt;
 
     #[sqlx::test]
-    async fn test_health_check(pool: PgPool) {
+    async fn test_health_check(pool: SqlitePool) {
         let db = Arc::new(Database::from_pool(pool));
         let app = api::create_app(db);
 

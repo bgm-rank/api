@@ -15,6 +15,7 @@ pub struct Subject {
     pub average_comment: Option<f64>,
     pub drop_rate: Option<f64>,
     pub air_weekday: Option<String>,
+    #[sqlx(json)]
     pub meta_tags: Vec<String>,
     #[sqlx(default)]
     pub media_type: Option<String>,

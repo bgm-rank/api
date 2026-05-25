@@ -10,3 +10,9 @@ GEMINI.md
 /target
 mutants.out/
 mutants.out.old/
+
+# SQLite database files
+*.db
+*.db-shm
+*.db-wal
+/data/

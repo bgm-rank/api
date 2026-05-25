@@ -113,6 +113,7 @@ impl QueryService {
             average_comment: Option<f64>,
             drop_rate: Option<f64>,
             air_weekday: Option<String>,
+            #[sqlx(json)]
             meta_tags: Vec<String>,
             media_type: Option<String>,
             rating: Option<String>,
@@ -120,16 +121,23 @@ impl QueryService {
 
         let rows = sqlx::query_as::<_, Top1Row>(
             r#"
-            SELECT DISTINCT ON (ss.season_id)
-                ss.season_id,
-                s.id, s.name, s.name_cn, s.images_grid, s.images_large,
-                s.rank, s.score, s.collection_total, s.average_comment,
-                s.drop_rate, s.air_weekday, s.meta_tags, s.media_type, s.rating
-            FROM season_subjects ss
-            JOIN subjects s ON ss.subject_id = s.id
-            ORDER BY ss.season_id DESC,
-                s.rank ASC NULLS LAST,
-                s.collection_total DESC NULLS LAST
+            SELECT season_id, id, name, name_cn, images_grid, images_large,
+                   rank, score, collection_total, average_comment,
+                   drop_rate, air_weekday, meta_tags, media_type, rating
+            FROM (
+                SELECT ss.season_id,
+                       s.id, s.name, s.name_cn, s.images_grid, s.images_large,
+                       s.rank, s.score, s.collection_total, s.average_comment,
+                       s.drop_rate, s.air_weekday, s.meta_tags, s.media_type, s.rating,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY ss.season_id
+                           ORDER BY s.rank ASC NULLS LAST, s.collection_total DESC NULLS LAST
+                       ) as rn
+                FROM season_subjects ss
+                JOIN subjects s ON ss.subject_id = s.id
+            )
+            WHERE rn = 1
+            ORDER BY season_id DESC
             "#,
         )
         .fetch_all(pool)
@@ -182,7 +190,7 @@ mod tests {
     use crate::dal::db::Database;
     use crate::dal::dto::{CreateSeason, CreateSeasonSubject, CreateSubject};
     use crate::dal::{SeasonRepository, SeasonSubjectRepository, SubjectRepository};
-    use sqlx::PgPool;
+    use sqlx::SqlitePool;
 
     fn make_create_subject(id: i32, rank: Option<i32>) -> CreateSubject {
         CreateSubject {
@@ -203,7 +211,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_list_seasons(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_list_seasons(pool: SqlitePool) -> sqlx::Result<()> {
         let db = Arc::new(Database::from_pool(pool.clone()));
 
         // Insert a season
@@ -225,7 +233,7 @@ mod tests {
 
     // T019 — query_service 精确评分与 rank 测试
     #[sqlx::test]
-    async fn test_query_service_returns_exact_score(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_query_service_returns_exact_score(pool: SqlitePool) -> sqlx::Result<()> {
         let db = Arc::new(Database::from_pool(pool.clone()));
         SeasonRepository::new(&pool)
             .create(CreateSeason {
@@ -259,7 +267,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_query_service_rank_999999_preserved(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_query_service_rank_999999_preserved(pool: SqlitePool) -> sqlx::Result<()> {
         let db = Arc::new(Database::from_pool(pool.clone()));
         SeasonRepository::new(&pool)
             .create(CreateSeason {
@@ -290,7 +298,7 @@ mod tests {
 
     // T039 — get_season_subjects 对 meta_tags 去重
     #[sqlx::test]
-    async fn test_query_service_deduplicates_meta_tags(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_query_service_deduplicates_meta_tags(pool: SqlitePool) -> sqlx::Result<()> {
         let db = Arc::new(Database::from_pool(pool.clone()));
         SeasonRepository::new(&pool)
             .create(CreateSeason {
@@ -324,7 +332,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_query_service_dedup_preserves_order(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_query_service_dedup_preserves_order(pool: SqlitePool) -> sqlx::Result<()> {
         let db = Arc::new(Database::from_pool(pool.clone()));
         SeasonRepository::new(&pool)
             .create(CreateSeason {
@@ -364,7 +372,7 @@ mod tests {
 
     // T032 — list_seasons 包含 updated_at 字段
     #[sqlx::test]
-    async fn test_list_seasons_includes_updated_at(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_list_seasons_includes_updated_at(pool: SqlitePool) -> sqlx::Result<()> {
         let db = Arc::new(Database::from_pool(pool.clone()));
         SeasonRepository::new(&pool)
             .create(CreateSeason {
@@ -392,7 +400,7 @@ mod tests {
     // T027 — query_service 新字段测试（air_weekday / drop_rate / average_comment）
 
     #[sqlx::test]
-    async fn test_query_service_air_weekday_returned(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_query_service_air_weekday_returned(pool: SqlitePool) -> sqlx::Result<()> {
         let db = Arc::new(Database::from_pool(pool.clone()));
         SeasonRepository::new(&pool)
             .create(CreateSeason {
@@ -422,7 +430,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_query_service_drop_rate_returned(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_query_service_drop_rate_returned(pool: SqlitePool) -> sqlx::Result<()> {
         let db = Arc::new(Database::from_pool(pool.clone()));
         SeasonRepository::new(&pool)
             .create(CreateSeason {
@@ -453,7 +461,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_query_service_average_comment_returned(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_query_service_average_comment_returned(pool: SqlitePool) -> sqlx::Result<()> {
         let db = Arc::new(Database::from_pool(pool.clone()));
         SeasonRepository::new(&pool)
             .create(CreateSeason {
@@ -484,7 +492,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_get_season_subjects_none_when_not_found(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_get_season_subjects_none_when_not_found(pool: SqlitePool) -> sqlx::Result<()> {
         let db = Arc::new(Database::from_pool(pool));
         let svc = QueryService::new(db);
         let result = svc.get_season_subjects(999999).await.unwrap();
@@ -493,7 +501,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_get_season_subjects_sorted_by_rank(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_get_season_subjects_sorted_by_rank(pool: SqlitePool) -> sqlx::Result<()> {
         let db = Arc::new(Database::from_pool(pool.clone()));
 
         SeasonRepository::new(&pool)

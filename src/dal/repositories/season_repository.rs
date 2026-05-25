@@ -1,5 +1,5 @@
 use crate::dal::dto::{CreateSeason, Season, UpdateSeason};
-use sqlx::PgPool;
+use sqlx::SqlitePool;
 
 fn log_db_error(operation: &'static str, table: &'static str, e: &sqlx::Error) {
     match e {
@@ -16,12 +16,12 @@ fn log_db_error(operation: &'static str, table: &'static str, e: &sqlx::Error) {
 }
 
 pub struct SeasonRepository<'a> {
-    pool: &'a PgPool,
+    pool: &'a SqlitePool,
 }
 
 #[allow(dead_code)]
 impl<'a> SeasonRepository<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a SqlitePool) -> Self {
         Self { pool }
     }
 
@@ -29,7 +29,7 @@ impl<'a> SeasonRepository<'a> {
         let row = sqlx::query_as::<_, Season>(
             r#"
             INSERT INTO seasons (season_id, year, season, name)
-            VALUES ($1, $2, $3, $4)
+            VALUES (?, ?, ?, ?)
             RETURNING season_id, year, season, name, created_at, updated_at
             "#,
         )
@@ -47,13 +47,13 @@ impl<'a> SeasonRepository<'a> {
         let row = sqlx::query_as::<_, Season>(
             r#"
             INSERT INTO seasons (season_id, year, season, name)
-            VALUES ($1, $2, $3, $4)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT (season_id)
             DO UPDATE SET
                 year = EXCLUDED.year,
                 season = EXCLUDED.season,
                 name = COALESCE(EXCLUDED.name, seasons.name),
-                updated_at = CURRENT_TIMESTAMP
+                updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
             RETURNING season_id, year, season, name, created_at, updated_at
             "#,
         )
@@ -71,7 +71,7 @@ impl<'a> SeasonRepository<'a> {
     pub async fn find_by_id(&self, season_id: i32) -> Result<Option<Season>, sqlx::Error> {
         let row = sqlx::query_as::<_, Season>(
             r#"
-            SELECT * FROM seasons WHERE season_id = $1
+            SELECT * FROM seasons WHERE season_id = ?
             "#,
         )
         .bind(season_id)
@@ -104,18 +104,18 @@ impl<'a> SeasonRepository<'a> {
             r#"
             UPDATE seasons
             SET
-                year = COALESCE($2, year),
-                season = COALESCE($3, season),
-                name = COALESCE($4, name),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE season_id = $1
+                year = COALESCE(?, year),
+                season = COALESCE(?, season),
+                name = COALESCE(?, name),
+                updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
+            WHERE season_id = ?
             RETURNING season_id, year, season, name, created_at, updated_at
             "#,
         )
-        .bind(season_id)
         .bind(update_season.year)
         .bind(update_season.season)
         .bind(update_season.name)
+        .bind(season_id)
         .fetch_one(self.pool)
         .await?;
 
@@ -123,18 +123,19 @@ impl<'a> SeasonRepository<'a> {
     }
 
     pub async fn touch_updated_at(&self, season_id: i32) -> Result<bool, sqlx::Error> {
-        let result =
-            sqlx::query("UPDATE seasons SET updated_at = CURRENT_TIMESTAMP WHERE season_id = $1")
-                .bind(season_id)
-                .execute(self.pool)
-                .await?;
+        let result = sqlx::query(
+            "UPDATE seasons SET updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') WHERE season_id = ?",
+        )
+        .bind(season_id)
+        .execute(self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
     }
 
     pub async fn delete(&self, season_id: i32) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             r#"
-            DELETE FROM seasons WHERE season_id = $1
+            DELETE FROM seasons WHERE season_id = ?
             "#,
         )
         .bind(season_id)
@@ -149,9 +150,8 @@ impl<'a> SeasonRepository<'a> {
 mod tests {
     use super::*;
 
-    // T005 — touch_updated_at（Red 阶段）
     #[sqlx::test]
-    async fn test_touch_updated_at_returns_true_when_exists(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_touch_updated_at_returns_true_when_exists(pool: SqlitePool) -> sqlx::Result<()> {
         let repo = SeasonRepository::new(&pool);
         repo.create(CreateSeason {
             season_id: 202601,
@@ -174,7 +174,9 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_touch_updated_at_returns_false_when_not_exists(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_touch_updated_at_returns_false_when_not_exists(
+        pool: SqlitePool,
+    ) -> sqlx::Result<()> {
         let repo = SeasonRepository::new(&pool);
         let result = repo.touch_updated_at(999999).await?;
         assert!(!result, "should return false for non-existent season");
@@ -182,7 +184,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_create_season(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_create_season(pool: SqlitePool) -> sqlx::Result<()> {
         let repo = SeasonRepository::new(&pool);
 
         let create_season = CreateSeason {
@@ -201,10 +203,9 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_upsert_season(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_upsert_season(pool: SqlitePool) -> sqlx::Result<()> {
         let repo = SeasonRepository::new(&pool);
 
-        // 1. 首次插入
         let insert_data = CreateSeason {
             season_id: 202701,
             year: 2027,
@@ -216,33 +217,27 @@ mod tests {
         assert_eq!(season_inserted.season_id, 202701);
         assert_eq!(season_inserted.name, Some("2027年手动备注名称".to_string()));
 
-        // 稍微等待一下确保 updated_at 的时间戳有变化（如果在意微秒级精度的话）
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        // 2. 模拟同步数据覆盖，name 传 None
         let update_data = CreateSeason {
             season_id: 202701,
             year: 2027,
-            season: "SPRING".to_string(), // 更新了季节
-            name: None,                   // 同步数据中没有 name
+            season: "SPRING".to_string(),
+            name: None,
         };
 
         let season_updated = repo.upsert(update_data).await?;
 
         assert_eq!(season_updated.season_id, 202701);
         assert_eq!(season_updated.season, "SPRING");
-
-        // 关键断言：验证原有的 name 没有被 NULL 覆盖
         assert_eq!(season_updated.name, Some("2027年手动备注名称".to_string()));
-
-        // 验证 updated_at 被正确更新
         assert!(season_updated.updated_at > season_inserted.updated_at);
 
         Ok(())
     }
 
     #[sqlx::test]
-    async fn test_find_season_by_id(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_find_season_by_id(pool: SqlitePool) -> sqlx::Result<()> {
         let repo = SeasonRepository::new(&pool);
 
         let season_id = 202510;
@@ -265,7 +260,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_find_all_season(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_find_all_season(pool: SqlitePool) -> sqlx::Result<()> {
         let repo = SeasonRepository::new(&pool);
 
         let create_seasons = vec![
@@ -295,7 +290,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_update_season(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_update_season(pool: SqlitePool) -> sqlx::Result<()> {
         let repo = SeasonRepository::new(&pool);
 
         let create_season = CreateSeason {
@@ -323,7 +318,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_delete_season(pool: PgPool) -> sqlx::Result<()> {
+    async fn test_delete_season(pool: SqlitePool) -> sqlx::Result<()> {
         let repo = SeasonRepository::new(&pool);
 
         let create_season = CreateSeason {
