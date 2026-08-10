@@ -14,6 +14,7 @@ jobs:
       platforms: linux/amd64
       push_to_images: |
         hexsix/bgm-rank-api
+        registry.fly.io/bgm-rank-api
       flavor: |
         latest=auto
       tags: |
