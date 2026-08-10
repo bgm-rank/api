@@ -1,0 +1,31 @@
+app = "bgm-rank-api"
+primary_region = "nrt"
+
+[build]
+
+[env]
+  DATABASE_URL = "sqlite:/app/data/bgm_rank.db"
+  RUST_LOG = "info"
+
+[[mounts]]
+  source = "bgm_rank_data"
+  destination = "/app/data"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
