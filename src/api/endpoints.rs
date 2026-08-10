@@ -23,7 +23,7 @@ use super::middleware::require_admin_token;
 use super::schemas::{
     AcceptedResponse, CreateSeasonRequest, DeleteOrphansResponse, DeleteSeasonResponse,
     DeletedResponse, EditSeasonRequest, EditSubjectRequest, ErrorResponse, OrphanSubjectItem,
-    RemovedResponse, SchedulerStatusResponse,
+    ReconcileAllResponse, RemovedResponse, SchedulerStatusResponse, SeasonReconcileItem,
 };
 
 #[derive(Serialize)]
@@ -307,6 +307,39 @@ pub async fn sync_all_seasons(State(state): State<AppState>) -> impl IntoRespons
         .into_response()
 }
 
+// POST /admin/seasons/reconcile —— 全量对账（同步返回汇总）
+pub async fn reconcile_seasons(State(state): State<AppState>) -> impl IntoResponse {
+    match state.sync_service.reconcile_all().await {
+        Ok(r) => Json(ReconcileAllResponse {
+            seasons_total: r.seasons_total,
+            seasons_skipped: r.seasons_skipped,
+            seasons_failed: r.seasons_failed,
+            total_added: r.total_added,
+            total_removed: r.total_removed,
+            hydrate_failed: r.hydrate_failed,
+            elapsed_ms: r.elapsed_ms,
+            changes: r
+                .changes
+                .into_iter()
+                .map(|d| SeasonReconcileItem {
+                    season_id: d.season_id,
+                    added: d.added,
+                    removed: d.removed,
+                    hydrate_failed: d.hydrate_failed,
+                })
+                .collect(),
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 // US3: POST /admin/scheduler/trigger
 pub async fn trigger_scheduler(State(state): State<AppState>) -> impl IntoResponse {
     match state.admin_service.trigger_scheduler_tick() {
@@ -515,6 +548,7 @@ pub fn admin_router(state: AppState) -> axum::Router {
         .route("/admin/deploy", post(trigger_deploy))
         .route("/admin/seasons", post(create_season))
         .route("/admin/seasons/sync-all", post(sync_all_seasons))
+        .route("/admin/seasons/reconcile", post(reconcile_seasons))
         .route("/admin/seasons/{season_id}", get(admin_get_season))
         .route("/admin/seasons/{season_id}", delete(delete_season))
         .route("/admin/seasons/{season_id}", patch(patch_season))

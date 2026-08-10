@@ -36,6 +36,14 @@ impl BangumiClient {
             base_url: Arc::from(reqwest::Url::parse(BANGUMI_API_BASE).unwrap()),
         }
     }
+
+    /// 指向自定义 base url，供测试注入 mock server
+    #[cfg(test)]
+    pub fn with_base_url(base_url: &str) -> Self {
+        let mut client = Self::new();
+        client.base_url = Arc::from(reqwest::Url::parse(base_url).unwrap());
+        client
+    }
 }
 
 impl Default for BangumiClient {

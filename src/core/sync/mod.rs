@@ -7,7 +7,7 @@ use crate::dal::{CreateSeason, CreateSubject, Database};
 use crate::dal::{SeasonRepository, SeasonSubjectRepository, SubjectRepository};
 use crate::services::bangumi::schemas::{Collection, Episode, InfoboxItem};
 use crate::services::bangumi::{BangumiClient, Subject as BangumiSubject};
-use crate::services::season_data::{MediaType, Rating, SeasonDataClient};
+use crate::services::season_data::{MediaType, Rating, SeasonDataClient, SeasonEntry};
 
 pub enum SyncProgressEvent {
     Progress { total: usize, done: usize, subject_id: i32 },
@@ -35,6 +35,20 @@ impl SyncService {
         Self {
             season_data_client: SeasonDataClient::new(),
             bangumi_client: BangumiClient::new(),
+            db,
+        }
+    }
+
+    /// 注入自定义 client，供测试指向 mock server
+    #[cfg(test)]
+    pub fn with_clients(
+        db: Arc<Database>,
+        season_data_client: SeasonDataClient,
+        bangumi_client: BangumiClient,
+    ) -> Self {
+        Self {
+            season_data_client,
+            bangumi_client,
             db,
         }
     }
@@ -123,10 +137,11 @@ impl SyncService {
         }
 
         // 4. Reconcile season_subjects
-        let (added, removed) = SeasonSubjectRepository::new(pool)
+        let (added_ids, removed_ids) = SeasonSubjectRepository::new(pool)
             .reconcile(season_id, bgm_ids)
             .await
             .context("reconcile 失败")?;
+        let (added, removed) = (added_ids.len(), removed_ids.len());
 
         // 5. Fetch Bangumi details per subject
         let mut updated = 0usize;
@@ -136,34 +151,9 @@ impl SyncService {
         let mut done = 0usize;
 
         for entry in &entries {
-            let avg_comment = match self
-                .bangumi_client
-                .get_episodes(entry.bgm_id, 0, 100, 0)
-                .await
-            {
-                Ok(paged) => calculate_average_comment(&paged.data, today),
-                Err(e) => {
-                    tracing::warn!(subject_id = entry.bgm_id, error = %e, "拉取 episodes 失败，降级为 None");
-                    None
-                }
-            };
-
-            match self.bangumi_client.get_subject(entry.bgm_id).await {
-                Ok(bgm_subject) => {
-                    if let Err(e) = subject_repo
-                        .upsert(to_create_subject(bgm_subject, avg_comment))
-                        .await
-                    {
-                        tracing::error!(subject_id = entry.bgm_id, error = %e, "upsert subject 失败");
-                        failed += 1;
-                    } else {
-                        updated += 1;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(subject_id = entry.bgm_id, error = %e, "拉取 subject 失败");
-                    failed += 1;
-                }
+            match self.hydrate_subject(entry.bgm_id, today).await {
+                Ok(()) => updated += 1,
+                Err(_) => failed += 1,
             }
             done += 1;
             if let Some(tx) = &progress_tx {
@@ -201,6 +191,189 @@ impl SyncService {
             removed,
             updated,
             failed,
+        })
+    }
+
+    /// 拉取单条番剧的 Bangumi 详情并写库。
+    ///
+    /// episodes 拉取失败降级为 None（不算失败）；subject 拉取或 upsert 失败返回 Err。
+    /// 错误已在内部记日志，调用方只需计数。
+    async fn hydrate_subject(&self, bgm_id: i32, today: chrono::NaiveDate) -> Result<()> {
+        let avg_comment = match self.bangumi_client.get_episodes(bgm_id, 0, 100, 0).await {
+            Ok(paged) => calculate_average_comment(&paged.data, today),
+            Err(e) => {
+                tracing::warn!(subject_id = bgm_id, error = %e, "拉取 episodes 失败，降级为 None");
+                None
+            }
+        };
+
+        let bgm_subject = match self.bangumi_client.get_subject(bgm_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(subject_id = bgm_id, error = %e, "拉取 subject 失败");
+                return Err(e);
+            }
+        };
+
+        SubjectRepository::new(self.db.pool())
+            .upsert(to_create_subject(bgm_subject, avg_comment))
+            .await
+            .inspect_err(|e| {
+                tracing::error!(subject_id = bgm_id, error = %e, "upsert subject 失败");
+            })?;
+
+        Ok(())
+    }
+
+    /// 全量对账：以 season-data.json 的 key 为准，把每个季度的成员关系校正到与上游一致。
+    ///
+    /// 与 `sync_season_data` 的区别：只对**新进来的**条目拉 Bangumi 详情，已有条目不重拉评分。
+    /// 成本 = 1 次 HTTP + 一轮本地 DB 写 + 「新增条目数」次 Bangumi 请求。
+    pub async fn reconcile_all(&self) -> Result<ReconcileAllResult> {
+        let start = std::time::Instant::now();
+        let today = chrono::Utc::now().date_naive();
+
+        let all = self
+            .season_data_client
+            .fetch_all()
+            .await
+            .context("拉取 season-data.json 失败")?;
+
+        let mut result = ReconcileAllResult {
+            seasons_total: all.len(),
+            ..Default::default()
+        };
+
+        // 按 season_id 倒序遍历：最近的季度先对账。
+        // 上游审核也是倒序进行的，跨季度改判几乎都落在近几季；
+        // 而首次跑要回填全部历史时耗时以小时计，倒序能保证中途被打断也已修好要紧的季度。
+        let mut keys: Vec<(i32, &String)> = Vec::new();
+        for key in all.keys() {
+            match season_key_to_id(key) {
+                Some(season_id) => keys.push((season_id, key)),
+                None => {
+                    tracing::warn!(key = %key, "无法解析 season key，跳过");
+                    result.seasons_skipped += 1;
+                }
+            }
+        }
+        keys.sort_unstable_by(|a, b| b.cmp(a));
+
+        for (season_id, key) in keys {
+            let entries = &all[key];
+
+            // 注意事项 3：上游会把没有 included 条目的季度也铺成空数组。
+            // 对这种 key 跑 reconcile 会把该季度成员全删光，宁可漏同步也别清空一整季。
+            if entries.is_empty() {
+                tracing::warn!(season_id, key = %key, "上游季度为空数组，跳过以免清空成员");
+                result.seasons_skipped += 1;
+                continue;
+            }
+
+            match self.reconcile_one(season_id, key, entries, today).await {
+                Ok(detail) => {
+                    result.total_added += detail.added.len();
+                    result.total_removed += detail.removed.len();
+                    result.hydrate_failed += detail.hydrate_failed;
+                    if !detail.added.is_empty() || !detail.removed.is_empty() {
+                        result.changes.push(detail);
+                    }
+                }
+                Err(e) => {
+                    // 单季失败不中断整轮
+                    tracing::error!(season_id, key = %key, error = %format!("{:#}", e), "对账季度失败");
+                    result.seasons_failed += 1;
+                }
+            }
+        }
+
+        result.elapsed_ms = start.elapsed().as_millis() as u64;
+        tracing::info!(
+            seasons_total = result.seasons_total,
+            seasons_skipped = result.seasons_skipped,
+            seasons_failed = result.seasons_failed,
+            added = result.total_added,
+            removed = result.total_removed,
+            hydrate_failed = result.hydrate_failed,
+            elapsed_ms = result.elapsed_ms,
+            "reconcile_all completed"
+        );
+
+        Ok(result)
+    }
+
+    async fn reconcile_one(
+        &self,
+        season_id: i32,
+        key: &str,
+        entries: &[SeasonEntry],
+        today: chrono::NaiveDate,
+    ) -> Result<SeasonReconcileDetail> {
+        use tokio::time::{Duration, sleep};
+
+        let pool = self.db.pool();
+        let month = season_id % 100;
+
+        // 注意事项 2：以 JSON 的 key 为准 upsert season，库里没有的季度也能建出来。
+        // upsert 的 name 有 COALESCE 保护，不会清掉已有季度名。
+        SeasonRepository::new(pool)
+            .upsert(CreateSeason {
+                season_id,
+                year: season_id / 100,
+                season: month_to_season(month)?,
+                name: None,
+            })
+            .await
+            .context("upsert season 失败")?;
+
+        // 保证 subjects 行存在（season_subjects 有 FK），并刷新 media_type/rating。
+        // 这里绝不能用 SubjectRepository::upsert —— 那会把已有条目的详情清成 NULL。
+        let meta_rows: Vec<(i32, Option<String>, Option<String>)> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.bgm_id,
+                    Some(media_type_to_str(&e.media_type).to_string()),
+                    Some(rating_to_str(&e.rating).to_string()),
+                )
+            })
+            .collect();
+        SubjectRepository::new(pool)
+            .upsert_meta_batch(&meta_rows)
+            .await
+            .context("upsert_meta_batch 失败")?;
+
+        let bgm_ids: Vec<i32> = entries.iter().map(|e| e.bgm_id).collect();
+        let (added, removed) = SeasonSubjectRepository::new(pool)
+            .reconcile(season_id, bgm_ids)
+            .await
+            .context("reconcile 失败")?;
+
+        if !removed.is_empty() {
+            tracing::warn!(season_id, key = %key, ids = ?removed, "对账删除成员");
+        }
+
+        // 只有新进来的条目在库里是空壳，必须补详情
+        let mut hydrate_failed = 0usize;
+        for &bgm_id in &added {
+            if self.hydrate_subject(bgm_id, today).await.is_err() {
+                hydrate_failed += 1;
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        if !added.is_empty() || !removed.is_empty() {
+            tracing::info!(season_id, key = %key, added = ?added, removed = ?removed, "对账季度完成");
+            if let Err(e) = SeasonRepository::new(pool).touch_updated_at(season_id).await {
+                tracing::warn!(season_id, error = %e, "touch_updated_at 失败");
+            }
+        }
+
+        Ok(SeasonReconcileDetail {
+            season_id,
+            added,
+            removed,
+            hydrate_failed,
         })
     }
 
@@ -248,6 +421,27 @@ pub struct OrphanSubjectItem {
     pub name_cn: Option<String>,
 }
 
+#[derive(Debug, Default)]
+pub struct ReconcileAllResult {
+    pub seasons_total: usize,
+    pub seasons_skipped: usize,
+    pub seasons_failed: usize,
+    pub total_added: usize,
+    pub total_removed: usize,
+    pub hydrate_failed: usize,
+    pub elapsed_ms: u64,
+    /// 只收 added / removed 非空的季度
+    pub changes: Vec<SeasonReconcileDetail>,
+}
+
+#[derive(Debug)]
+pub struct SeasonReconcileDetail {
+    pub season_id: i32,
+    pub added: Vec<i32>,
+    pub removed: Vec<i32>,
+    pub hydrate_failed: usize,
+}
+
 fn month_to_season(month: i32) -> Result<String> {
     match month {
         1 => Ok("WINTER".to_string()),
@@ -256,6 +450,25 @@ fn month_to_season(month: i32) -> Result<String> {
         10 => Ok("FALL".to_string()),
         _ => Err(anyhow!("Invalid month: {}", month)),
     }
+}
+
+/// `month_to_season` 的逆映射：`"2026-spring"` → `202604`
+///
+/// 无法解析（年份非法、季度名不认识、缺分隔符）时返回 None，由调用方跳过该 key。
+pub(crate) fn season_key_to_id(key: &str) -> Option<i32> {
+    let (year, season) = key.split_once('-')?;
+    let year: i32 = year.parse().ok()?;
+    if !(1900..=2999).contains(&year) {
+        return None;
+    }
+    let month = match season {
+        "winter" => 1,
+        "spring" => 4,
+        "summer" => 7,
+        "fall" => 10,
+        _ => return None,
+    };
+    Some(year * 100 + month)
 }
 
 fn media_type_to_str(mt: &MediaType) -> &'static str {
@@ -1094,5 +1307,236 @@ mod tests {
         assert_eq!(create.images_grid, Some("grid_url".to_string())); // kills L341 delete field images_grid
         assert_eq!(create.images_large, Some("large_url".to_string())); // kills L342 delete field images_large
         assert_eq!(create.collection_total, Some(15)); // kills L345 delete field collection_total
+    }
+
+    // ── season_key_to_id ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_season_key_to_id_all_seasons() {
+        assert_eq!(season_key_to_id("2026-winter"), Some(202601));
+        assert_eq!(season_key_to_id("2026-spring"), Some(202604));
+        assert_eq!(season_key_to_id("2026-summer"), Some(202607));
+        assert_eq!(season_key_to_id("2026-fall"), Some(202610));
+    }
+
+    #[test]
+    fn test_season_key_to_id_roundtrip_with_month_to_season() {
+        for (key, season_id, season) in [
+            ("2025-winter", 202501, "WINTER"),
+            ("2025-spring", 202504, "SPRING"),
+            ("2025-summer", 202507, "SUMMER"),
+            ("2025-fall", 202510, "FALL"),
+        ] {
+            assert_eq!(season_key_to_id(key), Some(season_id));
+            assert_eq!(month_to_season(season_id % 100).unwrap(), season);
+        }
+    }
+
+    #[test]
+    fn test_season_key_to_id_rejects_bad_input() {
+        assert_eq!(season_key_to_id("2026-autumn"), None); // 上游用 fall 不是 autumn
+        assert_eq!(season_key_to_id("2026spring"), None); // 缺分隔符
+        assert_eq!(season_key_to_id("abcd-spring"), None); // 年份非数字
+        assert_eq!(season_key_to_id("1899-spring"), None); // 年份越界
+        assert_eq!(season_key_to_id("3000-spring"), None); // 年份越界
+        assert_eq!(season_key_to_id(""), None);
+    }
+
+    // ── reconcile_all ─────────────────────────────────────────────────────────
+
+    /// 一整套 mock 环境。mockito 1.x 的 `Mock` 在 drop 时会从 server 上摘除，
+    /// 所以必须把 mock handle 一路持有到测试结束。
+    struct MockEnv {
+        _sd_server: mockito::ServerGuard,
+        _bgm_server: mockito::ServerGuard,
+        _mocks: Vec<mockito::Mock>,
+        db: Arc<Database>,
+        svc: SyncService,
+    }
+
+    /// `season_json` 是 season-data.json 的完整响应体；
+    /// Bangumi 侧对任何 subject 都返回同一份详情。
+    async fn mock_env(pool: SqlitePool, season_json: &str) -> MockEnv {
+        let mut bgm_server = mockito::Server::new_async().await;
+        let mut sd_server = mockito::Server::new_async().await;
+
+        let mocks = vec![
+            bgm_server
+                .mock("GET", mockito::Matcher::Regex(r"^/v0/episodes".into()))
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"total":0,"limit":100,"offset":0,"data":[]}"#)
+                .create_async()
+                .await,
+            bgm_server
+                .mock("GET", mockito::Matcher::Regex(r"^/v0/subjects/\d+".into()))
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"id":444957,"type":2,"name":"燃比娃","name_cn":"燃比娃","images":null,
+                        "rating":{"rank":100,"total":10,"count":{"8":10},"score":8.0},
+                        "collection":{"wish":1,"collect":2,"doing":3,"on_hold":4,"dropped":5},
+                        "infobox":[],"meta_tags":[],"tags":[]}"#,
+                )
+                .create_async()
+                .await,
+            sd_server
+                .mock("GET", "/season-data.json")
+                .with_header("content-type", "application/json")
+                .with_body(season_json)
+                .create_async()
+                .await,
+        ];
+
+        let db = Arc::new(Database::from_pool(pool));
+        let svc = SyncService::with_clients(
+            Arc::clone(&db),
+            SeasonDataClient::with_url(sd_server.url() + "/season-data.json"),
+            BangumiClient::with_base_url(&bgm_server.url()),
+        );
+
+        MockEnv {
+            _sd_server: sd_server,
+            _bgm_server: bgm_server,
+            _mocks: mocks,
+            db,
+            svc,
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_reconcile_all_adds_missing_subject_and_is_idempotent(pool: SqlitePool) {
+        let env = mock_env(
+            pool,
+            r#"{"2026-spring": [{"bgm_id": 444957, "media_type": "movie", "rating": "general"}]}"#,
+        )
+        .await;
+        let (db, svc) = (&env.db, &env.svc);
+
+        // 第一次：季度和条目都不存在，应新建并 hydrate
+        let r = svc.reconcile_all().await.unwrap();
+        assert_eq!(r.total_added, 1);
+        assert_eq!(r.total_removed, 0);
+        assert_eq!(r.hydrate_failed, 0);
+        assert_eq!(r.changes.len(), 1);
+        assert_eq!(r.changes[0].season_id, 202604);
+        assert_eq!(r.changes[0].added, vec![444957]);
+
+        // 注意事项 2：库里没有的季度应被 upsert 出来
+        let season = SeasonRepository::new(db.pool())
+            .find_by_id(202604)
+            .await
+            .unwrap()
+            .expect("2026-spring 应被自动创建");
+        assert_eq!(season.season, "SPRING");
+
+        // 新增条目应补到详情，不是空壳
+        let subject = SubjectRepository::new(db.pool())
+            .find_by_id(444957)
+            .await
+            .unwrap()
+            .expect("subject 应存在");
+        assert_eq!(subject.name_cn, Some("燃比娃".to_string()));
+        assert_eq!(subject.media_type, Some("movie".to_string()));
+
+        // 第二次：应完全幂等
+        let r2 = svc.reconcile_all().await.unwrap();
+        assert_eq!(r2.total_added, 0);
+        assert_eq!(r2.total_removed, 0);
+        assert!(r2.changes.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn test_reconcile_all_skips_empty_season_instead_of_wiping(pool: SqlitePool) {
+        // 注意事项 3：上游会把没有 included 条目的季度铺成空数组
+        let env = mock_env(pool, r#"{"2026-spring": []}"#).await;
+        let svc = &env.svc;
+        let pool = env.db.pool();
+
+        // 预置一个已有成员的季度
+        SeasonRepository::new(pool)
+            .upsert(CreateSeason {
+                season_id: 202604,
+                year: 2026,
+                season: "SPRING".to_string(),
+                name: None,
+            })
+            .await
+            .unwrap();
+        SubjectRepository::new(pool)
+            .upsert_meta_batch(&[(444957, Some("movie".into()), Some("general".into()))])
+            .await
+            .unwrap();
+        SeasonSubjectRepository::new(pool)
+            .insert_or_ignore(crate::dal::CreateSeasonSubject {
+                season_id: 202604,
+                subject_id: 444957,
+            })
+            .await
+            .unwrap();
+
+        let r = svc.reconcile_all().await.unwrap();
+        assert_eq!(r.seasons_skipped, 1);
+        assert_eq!(r.total_removed, 0, "空季度绝不能触发删除");
+
+        let members = SeasonSubjectRepository::new(pool)
+            .find_by_season_id(202604)
+            .await
+            .unwrap();
+        assert_eq!(members, vec![444957], "成员必须原样保留");
+    }
+
+    #[sqlx::test]
+    async fn test_reconcile_all_removes_stale_member(pool: SqlitePool) {
+        let env = mock_env(
+            pool,
+            r#"{"2026-spring": [{"bgm_id": 444957, "media_type": "movie", "rating": "general"}]}"#,
+        )
+        .await;
+        let svc = &env.svc;
+        let pool = env.db.pool();
+
+        SeasonRepository::new(pool)
+            .upsert(CreateSeason {
+                season_id: 202604,
+                year: 2026,
+                season: "SPRING".to_string(),
+                name: None,
+            })
+            .await
+            .unwrap();
+        SubjectRepository::new(pool)
+            .upsert_meta_batch(&[(111111, None, None)])
+            .await
+            .unwrap();
+        SeasonSubjectRepository::new(pool)
+            .insert_or_ignore(crate::dal::CreateSeasonSubject {
+                season_id: 202604,
+                subject_id: 111111,
+            })
+            .await
+            .unwrap();
+
+        let r = svc.reconcile_all().await.unwrap();
+        assert_eq!(r.total_added, 1);
+        assert_eq!(r.total_removed, 1);
+        assert_eq!(r.changes[0].removed, vec![111111]);
+
+        let members = SeasonSubjectRepository::new(pool)
+            .find_by_season_id(202604)
+            .await
+            .unwrap();
+        assert_eq!(members, vec![444957]);
+    }
+
+    #[sqlx::test]
+    async fn test_reconcile_all_skips_unparsable_key(pool: SqlitePool) {
+        let env = mock_env(
+            pool,
+            r#"{"2026-autumn": [{"bgm_id": 444957, "media_type": "tv", "rating": "general"}]}"#,
+        )
+        .await;
+
+        let r = env.svc.reconcile_all().await.unwrap();
+        assert_eq!(r.seasons_skipped, 1);
+        assert_eq!(r.total_added, 0);
     }
 }

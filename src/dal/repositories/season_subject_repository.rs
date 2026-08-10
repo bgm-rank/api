@@ -63,11 +63,12 @@ impl<'a> SeasonSubjectRepository<'a> {
         Ok(())
     }
 
+    /// 返回 (added_ids, removed_ids)
     pub async fn reconcile(
         &self,
         season_id: i32,
         new_subject_ids: Vec<i32>,
-    ) -> Result<(usize, usize), sqlx::Error> {
+    ) -> Result<(Vec<i32>, Vec<i32>), sqlx::Error> {
         use std::collections::HashSet;
 
         let current: HashSet<i32> = self
@@ -112,7 +113,7 @@ impl<'a> SeasonSubjectRepository<'a> {
         tx.commit()
             .await
             .inspect_err(|e| log_db_error("reconcile_commit", "season_subjects", e))?;
-        Ok((to_add.len(), to_remove.len()))
+        Ok((to_add, to_remove))
     }
 
     pub async fn find_by_season_id(&self, season_id: i32) -> Result<Vec<i32>, sqlx::Error> {
@@ -337,8 +338,8 @@ mod tests {
 
         let (added, removed) = repo.reconcile(202601, vec![515759, 517057, 548818]).await?;
 
-        assert_eq!(added, 1);
-        assert_eq!(removed, 1);
+        assert_eq!(added, vec![548818]);
+        assert_eq!(removed, vec![443106]);
 
         let remaining = repo.find_by_season_id(202601).await?;
         assert!(!remaining.contains(&443106), "A 应被删除");

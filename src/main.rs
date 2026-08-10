@@ -51,8 +51,12 @@ async fn main() {
     let state = AppState::new(Arc::clone(&db));
     let handle: SchedulerHandle = state.scheduler_handle.as_ref().clone();
 
-    let scheduler =
-        SchedulerService::new_with_deploy_hook(Arc::clone(&db), deploy_hook_url, handle);
+    let scheduler = SchedulerService::new_with_deploy_hook(
+        Arc::clone(&db),
+        deploy_hook_url,
+        Arc::clone(&state.sync_service),
+        handle,
+    );
     tokio::spawn(async move {
         if let Err(e) = scheduler.run().await {
             tracing::error!(error = %e, "Scheduler error");

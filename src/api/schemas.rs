@@ -68,6 +68,27 @@ pub struct DeleteSeasonResponse {
     pub deleted: bool,
 }
 
+// 全量对账 schemas
+#[derive(Serialize)]
+pub struct ReconcileAllResponse {
+    pub seasons_total: usize,
+    pub seasons_skipped: usize,
+    pub seasons_failed: usize,
+    pub total_added: usize,
+    pub total_removed: usize,
+    pub hydrate_failed: usize,
+    pub elapsed_ms: u64,
+    pub changes: Vec<SeasonReconcileItem>,
+}
+
+#[derive(Serialize)]
+pub struct SeasonReconcileItem {
+    pub season_id: i32,
+    pub added: Vec<i32>,
+    pub removed: Vec<i32>,
+    pub hydrate_failed: usize,
+}
+
 // T013: New schemas for admin API
 
 #[derive(Serialize)]

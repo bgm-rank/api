@@ -106,6 +106,51 @@ impl<'a> SubjectRepository<'a> {
         Ok(row)
     }
 
+    /// 只保证 subject 行存在、并刷新 media_type/rating，绝不触碰 name/rank/score 等详情字段。
+    ///
+    /// 用于全量对账：对账要为每条 entry 保证 subjects 行存在（season_subjects 有 FK），
+    /// 但绝大多数 entry 已有完整详情且本轮不会重拉，因此不能走 `upsert`
+    /// —— 那个 SQL 的 DO UPDATE 会把未提供的详情字段全部写成 NULL。
+    pub async fn upsert_meta_batch(
+        &self,
+        rows: &[(i32, Option<String>, Option<String>)],
+    ) -> Result<(), sqlx::Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .inspect_err(|e| log_db_error("upsert_meta_begin_tx", "subjects", e))?;
+
+        for (id, media_type, rating) in rows {
+            sqlx::query(
+                r#"
+                INSERT INTO subjects (id, media_type, rating)
+                VALUES (?, ?, ?)
+                ON CONFLICT (id) DO UPDATE SET
+                    media_type = COALESCE(EXCLUDED.media_type, subjects.media_type),
+                    rating = COALESCE(EXCLUDED.rating, subjects.rating),
+                    updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
+                "#,
+            )
+            .bind(id)
+            .bind(media_type)
+            .bind(rating)
+            .execute(&mut *tx)
+            .await
+            .inspect_err(|e| log_db_error("upsert_meta", "subjects", e))?;
+        }
+
+        tx.commit()
+            .await
+            .inspect_err(|e| log_db_error("upsert_meta_commit", "subjects", e))?;
+
+        Ok(())
+    }
+
     pub async fn find_due_for_update(
         &self,
         current_season_id: i32,
@@ -272,6 +317,74 @@ impl<'a> SubjectRepository<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 全量对账的关键回归防线：upsert_meta_batch 绝不能碰详情字段。
+    /// 若退回用 `upsert(CreateSubject { id, media_type, rating, ..Default::default() })`，
+    /// 该 SQL 的 DO UPDATE 会把 name/rank/score 等全部写成 NULL，而对账不会重拉详情补回。
+    #[sqlx::test]
+    async fn test_upsert_meta_batch_preserves_existing_details(pool: SqlitePool) -> sqlx::Result<()>
+    {
+        let repo = SubjectRepository::new(&pool);
+        repo.create(CreateSubject {
+            id: 444957,
+            name: Some("燃比娃".to_string()),
+            name_cn: Some("燃比娃".to_string()),
+            images_grid: Some("grid".to_string()),
+            rank: Some(123),
+            score: Some(8.5),
+            collection_total: Some(1000),
+            average_comment: Some(4.2),
+            drop_rate: Some(0.1),
+            air_weekday: Some("星期一".to_string()),
+            meta_tags: vec!["日本".to_string()],
+            media_type: Some("tv".to_string()),
+            rating: Some("general".to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+        // 上游把 media_type 从 tv 改判为 movie
+        repo.upsert_meta_batch(&[(444957, Some("movie".to_string()), None)])
+            .await?;
+
+        let s = repo.find_by_id(444957).await?.expect("subject 应存在");
+        assert_eq!(s.media_type, Some("movie".to_string()), "media_type 应被刷新");
+        assert_eq!(s.rating, Some("general".to_string()), "None 不应覆盖已有 rating");
+        assert_eq!(s.name, Some("燃比娃".to_string()));
+        assert_eq!(s.rank, Some(123));
+        assert_eq!(s.score, Some(8.5));
+        assert_eq!(s.collection_total, Some(1000));
+        assert_eq!(s.average_comment, Some(4.2));
+        assert_eq!(s.drop_rate, Some(0.1));
+        assert_eq!(s.air_weekday, Some("星期一".to_string()));
+        assert_eq!(s.meta_tags, vec!["日本".to_string()]);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_upsert_meta_batch_inserts_new_rows(pool: SqlitePool) -> sqlx::Result<()> {
+        let repo = SubjectRepository::new(&pool);
+        repo.upsert_meta_batch(&[
+            (1, Some("tv".to_string()), Some("general".to_string())),
+            (2, Some("movie".to_string()), Some("r18".to_string())),
+        ])
+        .await?;
+
+        let a = repo.find_by_id(1).await?.expect("1 应被插入");
+        assert_eq!(a.media_type, Some("tv".to_string()));
+        assert!(a.name.is_none(), "新行是空壳，详情待 hydrate");
+        assert_eq!(a.meta_tags, Vec::<String>::new(), "meta_tags 应走表默认值 '[]'");
+
+        let b = repo.find_by_id(2).await?.expect("2 应被插入");
+        assert_eq!(b.rating, Some("r18".to_string()));
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_upsert_meta_batch_empty_is_noop(pool: SqlitePool) -> sqlx::Result<()> {
+        SubjectRepository::new(&pool).upsert_meta_batch(&[]).await?;
+        Ok(())
+    }
 
     #[sqlx::test]
     async fn test_find_orphans(pool: SqlitePool) -> sqlx::Result<()> {
