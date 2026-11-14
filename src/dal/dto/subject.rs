@@ -7,6 +7,11 @@ pub struct Subject {
     pub id: i32,
     pub name: Option<String>,
     pub name_cn: Option<String>,
+    pub air_date: Option<String>,
+    pub platform: Option<String>,
+    pub summary: Option<String>,
+    pub tags: Option<String>,
+    pub nsfw: Option<bool>,
     pub images_grid: Option<String>,
     pub images_large: Option<String>,
     pub rank: Option<i32>,
@@ -17,10 +22,6 @@ pub struct Subject {
     pub air_weekday: Option<String>,
     #[sqlx(json)]
     pub meta_tags: Vec<String>,
-    #[sqlx(default)]
-    pub media_type: Option<String>,
-    #[sqlx(default)]
-    pub rating: Option<String>,
     pub updated_at: NaiveDateTime,
     #[sqlx(default)]
     pub last_updated_at: Option<DateTime<Utc>>,
@@ -31,6 +32,11 @@ pub struct CreateSubject {
     pub id: i32,
     pub name: Option<String>,
     pub name_cn: Option<String>,
+    pub air_date: Option<String>,
+    pub platform: Option<String>,
+    pub summary: Option<String>,
+    pub tags: Option<String>,
+    pub nsfw: Option<bool>,
     pub images_grid: Option<String>,
     pub images_large: Option<String>,
     pub rank: Option<i32>,
@@ -40,8 +46,6 @@ pub struct CreateSubject {
     pub drop_rate: Option<f64>,
     pub air_weekday: Option<String>,
     pub meta_tags: Vec<String>,
-    pub media_type: Option<String>,
-    pub rating: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

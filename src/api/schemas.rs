@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 use crate::core::scheduler::PublicTickStats;
+use crate::dal::dto::{MalBgmMatch, SeasonMal};
+
+fn deserialize_double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
 
 #[derive(Serialize)]
 #[allow(dead_code)]
@@ -68,25 +77,41 @@ pub struct DeleteSeasonResponse {
     pub deleted: bool,
 }
 
-// 全量对账 schemas
-#[derive(Serialize)]
-pub struct ReconcileAllResponse {
-    pub seasons_total: usize,
-    pub seasons_skipped: usize,
-    pub seasons_failed: usize,
-    pub total_added: usize,
-    pub total_removed: usize,
-    pub hydrate_failed: usize,
-    pub elapsed_ms: u64,
-    pub changes: Vec<SeasonReconcileItem>,
+// Match & season_mal admin schemas
+#[derive(Deserialize)]
+pub struct ListMatchesQuery {
+    pub season_id: Option<i32>,
+    pub status: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct PatchMatchRequest {
+    pub status: Option<String>,
+    pub bgm_id: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub reason: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub note: Option<Option<String>>,
 }
 
 #[derive(Serialize)]
-pub struct SeasonReconcileItem {
-    pub season_id: i32,
-    pub added: Vec<i32>,
-    pub removed: Vec<i32>,
-    pub hydrate_failed: usize,
+pub struct PatchMatchResponse {
+    #[serde(flatten)]
+    pub match_row: MalBgmMatch,
+    pub hydrated: bool,
+}
+
+#[derive(Deserialize)]
+pub struct MoveSeasonMalRequest {
+    pub target_season_id: i32,
+    pub note: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct MoveSeasonMalResponse {
+    pub moved: bool,
+    pub source: SeasonMal,
+    pub target: SeasonMal,
 }
 
 // T013: New schemas for admin API
@@ -132,6 +157,11 @@ pub struct DeletedResponse {
 #[derive(Serialize)]
 pub struct RemovedResponse {
     pub removed: bool,
+}
+
+#[derive(Serialize)]
+pub struct RestoredResponse {
+    pub restored: bool,
 }
 
 #[derive(Serialize)]

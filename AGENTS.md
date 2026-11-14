@@ -3,7 +3,7 @@
 ## 1. 项目概述
 
 `bgm-rank-api` 是 Bangumi 季度新番排行榜的后端 API 服务，采用 Rust (Edition 2024) 构建。核心职责包括：
-1. 从上游 [`season-data`](https://github.com/bgm-rank/season-data) 与 [Bangumi API (`api.bgm.tv`)](https://api.bgm.tv) 同步季度番剧索引、条目详情与剧集数据，计算派生指标（如弃番率、剧集平均评论数、放送星期等）并持久化到本地 SQLite 数据库。
+1. 管理 MAL 季度番剧索引、MAL-BGM 匹配关系与 [Bangumi API (`api.bgm.tv`)](https://api.bgm.tv) 条目详情及剧集数据，计算派生指标（如弃番率、剧集平均评论数、放送星期等）并持久化到本地 SQLite 数据库。
 2. 通过内置定时调度器按季度新鲜度分级刷新番剧数据，并在同步完成后触发前端部署 Webhook（如 Cloudflare Pages）。
 3. 面向前端提供低延迟的公开只读 API，面向管理员提供带 Bearer Token 鉴权的管理与同步接口（支持 SSE 进度流）。
 
@@ -20,14 +20,14 @@
 ## 2. 目录结构
 
 ```text
-/home/yui/repos/others/bgm-rank/api
+api
 ├── Cargo.toml                  # 依赖与包配置
 ├── Dockerfile                  # 多阶段容器镜像构建
 ├── compose.yml                 # Docker Compose 编排配置
 ├── .env.example                # 环境变量模板
 ├── migrations/                 # SQLx 自动迁移脚本
 └── src/
-    ├── main.rs                 # 程序入口：环境初始化、DB 连接、调度器后台任务、HTTP Server 启动
+    ├── main.rs                 # 程序入口：CLI 子命令分发 (import-season-data)、环境初始化、DB 连接、调度器后台任务、HTTP Server 启动
     ├── api/                    # 接口层 (HTTP Routing, Handlers, Middleware, Schemas)
     │   ├── mod.rs              # Router 组装与中间件层 (RequestId, TraceLayer)
     │   ├── endpoints.rs        # Public 与 Admin 路由 Handler 实现及 AppState 定义
@@ -37,25 +37,31 @@
     │       └── auth.rs         # 管理员 Bearer Token 鉴权中间件 (`require_admin_token`)
     ├── core/                   # 核心业务逻辑层 (Domain Services)
     │   ├── mod.rs
+    │   ├── import/mod.rs       # ImportService (`import_season_data`)：从旧 season.db 一次性迁移数据
     │   ├── query/mod.rs        # QueryService：公开接口的数据查询与聚合组装
-    │   ├── sync/mod.rs         # SyncService：番剧拉取、指标计算、SSE 同步流与全量对账 (Reconcile)
+    │   ├── sync/mod.rs         # SyncService：番剧拉取、指标计算与 SSE 同步流
     │   ├── scheduler/mod.rs    # SchedulerService：定时与手动触发的后台调度器
-    │   └── admin/mod.rs        # AdminService：管理端操作（部署触发、调度控制、条目/季度 CRUD）
+    │   └── admin/mod.rs        # AdminService：管理端操作（部署触发、调度控制、匹配审核、JSONL 导出、条目/季度 CRUD）
     ├── dal/                    # 数据访问层 (Data Access Layer)
     │   ├── mod.rs
     │   ├── db.rs               # Database 封装 (SqlitePool, WAL, Migrate, Ping)
-    │   ├── dto/                # 数据库表结构映射实体 (FromRow) 与写入/更新 DTO
+    │   ├── dto/                # 数据库表结构映射实体 (FromRow)、写入/更新 DTO 与导出行 DTO
+    │   │   ├── mod.rs
+    │   │   ├── mal_anime.rs
+    │   │   ├── mal_bgm_match.rs # 含 MalBgmMatch、UpdateMalBgmMatch、MalBgmMatchExportRow
     │   │   ├── season.rs
-    │   │   ├── subject.rs
-    │   │   └── season_subject.rs
-    │   └── repositories/       # 仓储实现：封装所有原始 SQL 操作
+    │   │   ├── season_mal.rs    # 含 SeasonMal、SeasonMalExportRow
+    │   │   └── subject.rs
+    │   └── repositories/       # 仓储实现：封装所有原始 SQL 操作（含导出查询）
+    │       ├── mod.rs
+    │       ├── mal_anime_repository.rs
+    │       ├── mal_bgm_match_repository.rs # 含 list_for_export 导出查询
+    │       ├── season_mal_repository.rs    # 含 list_for_export 导出查询
     │       ├── season_repository.rs
-    │       ├── subject_repository.rs
-    │       └── season_subject_repository.rs
+    │       └── subject_repository.rs
     └── services/               # 外部服务客户端层
         ├── mod.rs
         ├── bangumi/            # Bangumi v0 API 客户端 (`GET /v0/subjects/{id}`, `GET /v0/episodes`)
-        ├── season_data/        # GitHub Releases `season-data.json` 拉取客户端
         └── deploy_hook/        # 外部部署 Webhook 触发客户端 (`DeployHookClient`)
 ```
 
@@ -63,28 +69,29 @@
 
 ## 3. 四层架构与职责边界
 
-项目严格遵循自顶向下的四层架构设计：
+项目严格遵循自顶向下的四层架构设计（入口由 `src/main.rs` 负责 CLI 子命令分发：当首个参数为 `import-season-data` 时直接执行一次性导入后退出，否则启动后台调度器与 HTTP Server）：
 
 1. **API 层 (`src/api/`)**
-   - 仅负责 HTTP 协议转换（路径参数、JSON Body 解析、HTTP 状态码映射、SSE 事件流包装）、请求级追踪 (`x-request-id`) 和权限校验。
+   - 仅负责 HTTP 协议转换（路径参数、JSON Body / NDJSON 导出响应构建、HTTP 状态码映射、SSE 事件流包装）、请求级追踪 (`x-request-id`) 和权限校验。
    - **禁止**在 Handler 中直接编写 SQL 或直接调用 `src/services/` 中的外部 HTTP 客户端，所有操作必须委托给 `AppState` 中的 `core` 服务。
 2. **Core 业务层 (`src/core/`)**
-   - **`QueryService`**: 处理公开查询，包含季度列表、当前季度判定、各季度 Top 1 番剧提取、季度下属番剧按 `rank ASC NULLS LAST` 排序等逻辑。
-   - **`SyncService`**: 核心同步引擎。结合 `SeasonDataClient` 与 `BangumiClient`，拉取番剧元信息与本篇剧集列表，计算派生字段：
-     - `collection_total`: `collect + doing + on_hold + dropped`（不含 `wish`）
+   - **`QueryService`**: 处理公开查询，包含季度列表、当前季度判定、各季度 Top 1 番剧提取（仅 `tv` 且排除 `kids`/`r18`）、季度下属番剧按 `rank ASC NULLS LAST` 排序（含 `N:1` 映射去重及 `map_mal_rating` 分级映射）等逻辑。
+   - **`SyncService`**: 核心同步引擎。使用 `BangumiClient` 按 `season_mal (is_removed = 0)` 与 `mal_bgm_matches (status = 'included')` 关联拉取番剧元信息与本篇剧集列表，计算派生字段：
+     - `collection_total`: `wish + collect + doing + on_hold + dropped`
      - `drop_rate`: `dropped / collection_total`
      - `average_comment`: 已放送正片剧集的评论数均值
      - `air_weekday`: 从 Infobox 中提取放送星期
-     - 支持通过 `mpsc::Sender<SyncProgressEvent>` 推送实时同步进度，以及全量对账 (`reconcile_all`)。
-   - **`SchedulerService`**: 在 UTC+8 的 `0, 4, 8, 12, 16, 20` 整点唤醒（或通过 `SchedulerHandle` 手动唤醒）。每次 Tick 先执行 `reconcile_all` 对账，再根据季度距离（`age`）按不同时间间隔刷新到期番剧，最后触发 Deploy Hook（手动触发除外）。使用 `AtomicBool` 防止重入并发。
-   - **`AdminService`**: 封装管理员对季度、番剧、关联关系的修改/删除，以及对调度器和 Deploy Hook 的控制。
+     - 支持通过 `mpsc::Sender<SyncProgressEvent>` 推送实时同步进度。
+   - **`SchedulerService`**: 在 UTC+8 的 `0, 4, 8, 12, 16, 20` 整点唤醒（或通过 `SchedulerHandle` 手动唤醒）。每次 Tick 根据季度距离（`age`）按不同时间间隔刷新到期番剧，最后触发 Deploy Hook（手动触发除外）。使用 `AtomicBool` 防止重入并发。
+   - **`AdminService`**: 封装管理员对季度、番剧、匹配审核、`season_mal` 跨季移动的修改/删除，JSONL 导出（`export_season_mal_jsonl`、`export_matches_jsonl`），以及对调度器和 Deploy Hook 的控制。
+   - **`import` 模块 (`import_season_data`)**: 供 `main.rs` 的一次性 `import-season-data` CLI 子命令调用，在单事务中从旧 `season.db`（及可选原始 MAL JSON 目录）幂等迁移 `seasons`、`subjects` 骨架、`mal_anime`、`season_mal` 与 `mal_bgm_matches`。
 3. **DAL 数据访问层 (`src/dal/`)**
    - `Database` 负责管理 `SqlitePool`。
-   - `SeasonRepository`、`SubjectRepository`、`SeasonSubjectRepository` 封装针对 `seasons`、`subjects`、`season_subjects` 三张表的所有 SQL 查询。
+   - `SeasonRepository`、`SubjectRepository`、`MalAnimeRepository`、`SeasonMalRepository`、`MalBgmMatchRepository` 封装针对 `seasons`、`subjects`、`mal_anime`、`season_mal`、`mal_bgm_matches` 五张表的所有 SQL 查询；其中 `SeasonMalRepository::list_for_export` 与 `MalBgmMatchRepository::list_for_export` 分别投影导出 `SeasonMalExportRow` 与 `MalBgmMatchExportRow`。
    - 数据库错误通过统一的 `log_db_error` 按错误类型分级记录日志（`RowNotFound` -> `debug`, 唯一约束冲突 -> `warn`, 其他 -> `error`）。
 4. **Services 外部客户端层 (`src/services/`)**
    - 封装对第三方 HTTP 服务的请求、超时/重定向策略与响应反序列化。
-   - 所有客户端均提供注入自定义 URL 的构造方法（如 `BangumiClient::with_base_url`、`SeasonDataClient::with_url`），以便在单元测试中配合 `mockito` 拦截请求。
+   - 所有客户端均提供注入自定义 URL 的构造方法（如 `BangumiClient::with_base_url`、`DeployHookClient::new`），以便在单元测试中配合 `mockito` 拦截请求。
 
 ---
 
@@ -104,19 +111,24 @@
 
 | 方法 | 路径 | 说明 |
 | :--- | :--- | :--- |
-| `POST` | `/admin/seasons` | 创建并同步新季度（仅允许月份 `1, 4, 7, 10`） |
+| `POST` | `/admin/seasons` | 创建并同步新季度（仅允许月份 `1, 4, 7, 10`），返回 **SSE (`text/event-stream`)** 实时进度事件 |
 | `POST` | `/admin/seasons/sync-all` | 后台异步重同步所有季度 |
-| `POST` | `/admin/seasons/reconcile` | 以 `season-data.json` 为准执行全量季度成员对账 |
 | `GET` | `/admin/seasons/{season_id}` | 获取单个季度详情 |
 | `PATCH` | `/admin/seasons/{season_id}` | 修改季度信息（如自定义名称） |
 | `DELETE` | `/admin/seasons/{season_id}` | 删除指定季度及其关联关系 |
 | `POST` | `/admin/seasons/{season_id}/sync` | 重同步指定季度，返回 **SSE (`text/event-stream`)** 实时进度事件 |
-| `DELETE` | `/admin/seasons/{season_id}/subjects/{subject_id}` | 移除某季度与某番剧的关联关系 |
-| `GET` | `/admin/subjects/orphans` | 查询不属于任何季度的孤儿番剧 |
-| `DELETE` | `/admin/subjects/orphans` | 批量清理孤儿番剧 |
+| `DELETE` | `/admin/seasons/{season_id}/mal/{mal_id}` | 标记某季度的 `season_mal` 行 `is_removed = 1` |
+| `POST` | `/admin/seasons/{season_id}/mal/{mal_id}/move` | 将 `mal_id` 从当前季度移至目标季度（源季标记 `is_removed = 1`，目标季写入 `manual`） |
+| `POST` | `/admin/seasons/{season_id}/mal/{mal_id}/restore` | 恢复某季度被软移除的 `season_mal` 行（`is_removed = 0`，行不存在返回 `404`） |
+| `GET` | `/admin/matches` | 查询匹配记录列表（支持可选 `?season_id=`（关联 `season_mal.is_removed = 0`）与 `?status=` 过滤；返回匹配字段、`mal_anime` 字段及已绑定 `subject` 摘要） |
+| `PATCH` | `/admin/matches/{mal_id}` | 人工更新匹配状态/绑定 `bgm_id`（`bgm_id > 0` 时确保骨架行；`included`/`excluded` 设 `source = 'human'`，`pending` 重置 `source`/`confidence`/`bgm_id`；`included` 时非致命触发 `hydrate_subject` 并返回 `hydrated: bool`） |
+| `GET` | `/admin/export/season_mal` | 导出 `season_mal` 人工覆盖与移除记录（`origin = 'manual' OR is_removed = 1`），返回 `application/x-ndjson` |
+| `GET` | `/admin/export/matches` | 导出全量 `mal_bgm_matches` 匹配记录，返回 `application/x-ndjson` |
+| `GET` | `/admin/subjects/orphans` | 查询未被任何 `mal_bgm_matches.bgm_id IS NOT NULL` 引用的孤儿番剧 |
+| `DELETE` | `/admin/subjects/orphans` | 批量清理孤儿番剧（排除任何 `mal_bgm_matches.bgm_id IS NOT NULL` 引用的番剧） |
 | `GET` | `/admin/subjects/{subject_id}` | 获取单个番剧详情 |
 | `PATCH` | `/admin/subjects/{subject_id}` | 手动微调番剧字段 |
-| `DELETE` | `/admin/subjects/{subject_id}` | 删除单个番剧 |
+| `DELETE` | `/admin/subjects/{subject_id}` | 删除单个番剧（同事务重置关联 `mal_bgm_matches` 为 `pending`） |
 | `POST` | `/admin/scheduler/trigger` | 手动触发一次调度器 Tick（若正在运行则返回 `409 Conflict`） |
 | `GET` | `/admin/scheduler/status` | 查询调度器运行状态及上次 Tick 统计信息 |
 | `POST` | `/admin/deploy` | 手动触发 `DEPLOY_HOOK_URL` |
@@ -128,7 +140,7 @@
 | 变量名 | 必填 | 默认值 | 说明 |
 | :--- | :---: | :--- | :--- |
 | `DATABASE_URL` | 是 | - | SQLite 连接字符串，例如 `sqlite:./bgm_rank.db` |
-| `ADMIN_TOKEN` | 是 | - | `/admin/*` 接口鉴权所需的 Bearer Token |
+| `ADMIN_TOKEN` | 是 | - | `/admin/*` 接口鉴权所需的 Bearer Token（缺失或为空时服务拒绝启动，中间件亦拒绝所有请求） |
 | `BGM_TOKEN` | 否 | 无 | Bangumi API 访问令牌（用于提升速率限制或访问受限条目） |
 | `DEPLOY_HOOK_URL` | 否 | 无 | 同步完成后触发的前端构建 Webhook URL |
 | `RUST_LOG` | 否 | `info` | `tracing` 日志过滤级别（如 `debug`, `info`） |
@@ -143,10 +155,11 @@
 - **运行全部测试**: `cargo test`
 - **代码格式检查与修复**: `cargo fmt`
 - **静态分析与 Lint**: `cargo clippy`
+- **一次性数据迁移 CLI**: `cargo run -- import-season-data --season-db <path> [--mal-json-dir <dir>]`（需配置 `DATABASE_URL`）
 
 ### 6.2 测试规范 (TDD)
 - **数据库隔离测试**: 涉及 `dal`、`core` 或 `api` 的测试应优先使用 `#[sqlx::test]` 宏（由 `sqlx` 自动创建临时内存/文件数据库并执行 `migrations/`），通过 `Database::from_pool(pool)` 构造测试实例，严禁在单元测试中污染本地开发库。
-- **外部网络隔离**: 任何涉及 `BangumiClient`、`SeasonDataClient` 或 `DeployHookClient` 的测试必须使用 `mockito::Server::new_async().await` 在本地启动 Mock Server，并通过 `with_base_url` / `with_url` / `SyncService::with_clients` 注入，严禁在测试中发起真实外网请求。
+- **外部网络隔离**: 任何涉及 `BangumiClient` 或 `DeployHookClient` 的测试必须使用 `mockito::Server::new_async().await` 在本地启动 Mock Server，并通过 `with_base_url` / `SyncService::with_clients` 注入，严禁在测试中发起真实外网请求。
 - **路由与中间件测试**: 使用 `tower::ServiceExt::oneshot` 直接向 `axum::Router` 发送构造的 `http::Request` 进行端到端断言。
 - **日志断言**: 需要验证特定日志字段（如 `request_id`、鉴权失败原因、启动状态）时，使用 `#[tracing_test::traced_test]` 配合 `logs_contain(...)`。
 

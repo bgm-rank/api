@@ -89,7 +89,7 @@ Base URL (prod): `https://api.rinshankaiho.fun`
 
 获取所有季度各自排名第一的番剧，按 `season_id` 降序排列。
 
-选取规则：优先选该季度 `rank` 最小的番剧；若该季度所有番剧均无 `rank`，则选 `collection_total` 最多的。
+选取规则：仅统计 `mal_anime.media_type = 'tv'` 且排除 `kids`（`g` / `pg`）与 `r18`（`r+` / `rx`）分级的番剧；按 `rank` 升序排列（无 `rank` 的排在末尾），若所有番剧均无 `rank` 则选 `collection_total` 最多者。
 
 **响应 200**
 
@@ -110,8 +110,8 @@ Base URL (prod): `https://api.rinshankaiho.fun`
       "drop_rate": 0.03,
       "air_weekday": "星期五",
       "meta_tags": ["TV", "奇幻"],
-      "media_type": "TV",
-      "rating": "G"
+      "media_type": "tv",
+      "rating": "general"
     }
   }
 ]
@@ -126,7 +126,7 @@ Base URL (prod): `https://api.rinshankaiho.fun`
 
 ### GET /api/seasons/{season_id}/subjects
 
-获取指定季度的番剧列表，按 `rank` 升序排列（无 rank 的排在末尾）。
+获取指定季度的番剧列表，按 `rank` 升序排列（无 rank 的排在末尾）。仅返回 `season_mal.is_removed = 0` 且 `mal_bgm_matches.status = 'included'` 的条目；当多个 `mal_id` 映射到同一 Bangumi `subject_id` 时，按 `media_type` 优先级（`tv > movie > ova > ona > 其他`）及 `mal_id` 升序去重。
 
 **路径参数**
 
@@ -151,8 +151,8 @@ Base URL (prod): `https://api.rinshankaiho.fun`
     "drop_rate": 0.03,
     "air_weekday": "星期五",
     "meta_tags": ["TV", "奇幻", "冒险"],
-    "media_type": "TV",
-    "rating": "G"
+    "media_type": "tv",
+    "rating": "general"
   }
 ]
 ```
@@ -164,15 +164,15 @@ Base URL (prod): `https://api.rinshankaiho.fun`
 | `name_cn` | `string \| null` | 中文名 |
 | `images_grid` | `string \| null` | 小图 URL（网格封面） |
 | `images_large` | `string \| null` | 大图 URL |
-| `rank` | `number \| null` | Bangumi 全站排名，如果没有排名则返回999999 |
-| `score` | `number \| null` | 评分（精度约 4 位小数） |
+| `rank` | `number \| null` | Bangumi 全站排名；同步时原始 `rank = 0` 会规范化为 `999999` |
+| `score` | `number \| null` | 评分（由各星级人数加权计算，精度约 4 位小数） |
 | `collection_total` | `number \| null` | 总收藏数 |
-| `average_comment` | `number \| null` | 平均吐槽数（由已播集数计算） |
+| `average_comment` | `number` | 平均吐槽数（由已播正片集数计算，无已播集数时为 `0`） |
 | `drop_rate` | `number \| null` | 弃坑率（0~1） |
 | `air_weekday` | `string \| null` | 播出星期，如 `"星期五"` |
 | `meta_tags` | `string[]` | 标签列表，已去重保留首次出现顺序 |
-| `media_type` | `string \| null` | 媒体类型，如 `"TV"` |
-| `rating` | `string \| null` | 分级，如 `"G"` |
+| `media_type` | `string \| null` | 原始 MAL 媒体类型（如 `"tv"`、`"ona"`、`"ova"`、`"movie"`、`"special"`、`"tv_special"` 等） |
+| `rating` | `string \| null` | 分级归类结果，枚举值：`general` / `kids` / `r18`；由 `mal_anime.rating` 映射：`g` / `pg` → `kids`，`r+` / `rx` → `r18`，`pg_13` / `r` / `null` 及其他值 → `general` |
 
 **响应 404** — 季度不存在
 
@@ -192,7 +192,7 @@ Authorization: Bearer <ADMIN_TOKEN>
 
 ### POST /admin/seasons
 
-创建新季度并从 Bangumi 同步数据（同步操作为阻塞，可能耗时较长）。
+创建（或更新）季度并从 Bangumi 同步该季度内已确认匹配（`season_mal.is_removed = 0` 且 `mal_bgm_matches.status = 'included'`）的条目详情，返回 **SSE (`text/event-stream`)** 实时进度流。
 
 **请求体**
 
@@ -210,39 +210,33 @@ Authorization: Bearer <ADMIN_TOKEN>
 | `month` | `number` | 是 | 月份，仅支持 `1`、`4`、`7`、`10` |
 | `name` | `string` | 否 | 自定义名称 |
 
-**响应 201**
+**响应 200（`Content-Type: text/event-stream`）**
 
-```json
-{
-  "season_id": 202601,
-  "subjects_added": 42,
-  "subjects_removed": 0,
-  "subjects_updated": 3,
-  "subjects_failed": 0
-}
+每条事件为标准 SSE `data:` 行（JSON 负载）：
+
+```text
+data: {"type":"progress","total":42,"done":1,"subject_id":12345}
+
+data: {"type":"done","season_id":202601,"added":0,"removed":0,"updated":42,"failed":0}
 ```
 
-**响应 400** — `month` 不在允许值内
+失败时推送：
+
+```text
+data: {"type":"error","message":"错误描述"}
+```
+
+**响应 400** — `month` 不在允许值内（返回标准 JSON `{ "error": "..." }`）
 
 ---
 
 ### POST /admin/seasons/{season_id}/sync
 
-重新同步指定季度的数据（阻塞）。
+重新同步指定季度内已纳入匹配（`season_mal.is_removed = 0` 且 `mal_bgm_matches.status = 'included'`）的条目详情，返回 **SSE (`text/event-stream`)** 实时进度流。
 
-**响应 200**
+**响应 200（`Content-Type: text/event-stream`）**
 
-```json
-{
-  "season_id": 202601,
-  "subjects_added": 0,
-  "subjects_removed": 0,
-  "subjects_updated": 5,
-  "subjects_failed": 0
-}
-```
-
-**响应 500** — 季度不存在或同步失败
+事件格式同 `POST /admin/seasons`。若季度不存在，流内会推送 `{"type":"error","message":"Season <season_id> not found"}`。
 
 ---
 
@@ -294,7 +288,7 @@ Authorization: Bearer <ADMIN_TOKEN>
 }
 ```
 
-**响应 200** — 返回更新后的 Season 对象（同 GET /admin/seasons/{id}）
+**响应 200** — 返回更新后的 Season 对象（同 `GET /admin/seasons/{season_id}`）
 
 **响应 404** — 季度不存在
 
@@ -302,7 +296,7 @@ Authorization: Bearer <ADMIN_TOKEN>
 
 ### DELETE /admin/seasons/{season_id}
 
-删除指定季度（不删除关联的番剧记录）。
+删除指定季度（级联删除该季度的 `season_mal` 关联，并自动清理因此成为孤立番剧的 `subjects` 记录）。
 
 **响应 200**
 
@@ -317,9 +311,16 @@ Authorization: Bearer <ADMIN_TOKEN>
 
 ---
 
-### DELETE /admin/seasons/{season_id}/subjects/{subject_id}
+### DELETE /admin/seasons/{season_id}/mal/{mal_id}
 
-将指定番剧从季度中移除（仅解除关联，不删除番剧记录本身）。
+将指定 `mal_id` 从该季度软移除（将 `season_mal.is_removed` 置为 `1`，不删除 `mal_anime` 或 `subjects` 记录）。
+
+**路径参数**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `season_id` | `number` | 季度 ID |
+| `mal_id` | `number` | MAL 条目 ID（注意不是 Bangumi `subject_id`） |
 
 **响应 200**
 
@@ -331,9 +332,229 @@ Authorization: Bearer <ADMIN_TOKEN>
 
 ---
 
+### POST /admin/seasons/{season_id}/mal/{mal_id}/restore
+
+恢复该季度中被软移除的 `mal_id`（将 `season_mal.is_removed` 置为 `0`）。
+
+**路径参数**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `season_id` | `number` | 季度 ID |
+| `mal_id` | `number` | MAL 条目 ID |
+
+**响应 200**
+
+```json
+{ "restored": true }
+```
+
+**响应 404** — 关联不存在
+
+---
+
+### POST /admin/seasons/{season_id}/mal/{mal_id}/move
+
+将 `mal_id` 从当前季度移动到目标季度（在源季度标记 `is_removed = 1`，在目标季度写入/更新为 `origin = "manual"`, `is_removed = 0`）。
+
+**请求体**
+
+```json
+{
+  "target_season_id": 202604,
+  "note": "跨季调整"
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `target_season_id` | `number` | 是 | 目标季度 ID（不可与源 `season_id` 相同） |
+| `note` | `string` | 否 | 备注（同时更新源记录和目标记录的 `note`） |
+
+**响应 200**
+
+```json
+{
+  "moved": true,
+  "source": {
+    "season_id": 202601,
+    "mal_id": 1001,
+    "origin": "mal",
+    "is_removed": true,
+    "note": "跨季调整",
+    "created_at": "2026-01-01T00:00:00"
+  },
+  "target": {
+    "season_id": 202604,
+    "mal_id": 1001,
+    "origin": "manual",
+    "is_removed": false,
+    "note": "跨季调整",
+    "created_at": "2026-04-01T00:00:00"
+  }
+}
+```
+
+**响应 400** — `target_season_id` 与源 `season_id` 相同  
+**响应 404** — 目标季度不存在，或源季度与 `mal_id` 的关联不存在
+
+---
+
+### GET /admin/matches
+
+查询 `mal_bgm_matches` 匹配记录列表，按 `mal_id` 升序排列。每条记录除匹配字段外，同时内联关联的 `mal_anime` 基础字段（`title`、`title_ja`、`media_type`、`rating`）以及已绑定的 `subject` 摘要（未绑定时为 `null`）。
+
+**查询参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `season_id` | `number` | 否 | 按季度过滤（内连接 `season_mal` 且仅包含 `is_removed = 0` 的有效条目） |
+| `status` | `string` | 否 | 可选过滤值：`pending` / `included` / `excluded` |
+
+**响应 200**
+
+```json
+[
+  {
+    "mal_id": 52991,
+    "status": "included",
+    "source": "human",
+    "bgm_id": 400602,
+    "confidence": 1.0,
+    "candidates": null,
+    "reason": null,
+    "note": "人工核对",
+    "error": null,
+    "updated_at": "2026-03-10T08:00:00",
+    "title": "Sousou no Frieren",
+    "title_ja": "葬送のフリーレン",
+    "media_type": "tv",
+    "rating": "pg_13",
+    "subject": {
+      "id": 400602,
+      "name": "葬送のフリーレン",
+      "name_cn": "葬送的芙莉莲",
+      "rank": 1,
+      "score": 9.1
+    }
+  }
+]
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `mal_id` ~ `updated_at` | - | `mal_bgm_matches` 匹配字段 |
+| `title` | `string` | `mal_anime.title` |
+| `title_ja` | `string \| null` | `mal_anime.title_ja` |
+| `media_type` | `string` | `mal_anime.media_type` |
+| `rating` | `string \| null` | `mal_anime.rating`（MAL 原始分级） |
+| `subject` | `object \| null` | 绑定的 Bangumi 番剧摘要（`id`、`name`、`name_cn`、`rank`、`score`）；未绑定 `bgm_id` 时为 `null` |
+
+**响应 400** — `status` 参数不在允许值内
+
+---
+
+### PATCH /admin/matches/{mal_id}
+
+人工审核并更新指定 `mal_id` 的匹配状态与绑定的 `bgm_id`：
+- 当最终 `status` 为 `"included"` 或 `"excluded"` 时，将 `source` 置为 `"human"`。
+- 当最终 `status` 为 `"pending"` 时，将 `source`、`confidence` 重置为 `null`；若未显式传入 `bgm_id`，同时将 `bgm_id` 重置为 `null`。
+- 若传入 `bgm_id`（必须为 `> 0` 的正整数），无论最终 `status` 为何值，均会确保 `subjects` 骨架行存在（`INSERT OR IGNORE`）。
+- 当最终 `status` 为 `"included"` 时，会调用 Bangumi API 同步该 `bgm_id` 的详情；若同步失败，匹配决策仍保留成功并返回 **200**，响应中通过 `hydrated: false` 标明详情未同步成功，并在服务端记录 `WARN` 日志。
+
+**请求体**（所有字段均为可选）
+
+```json
+{
+  "status": "included",
+  "bgm_id": 400602,
+  "reason": null,
+  "note": "人工绑定"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `status` | `string` | `pending` / `included` / `excluded`，省略时沿用原值 |
+| `bgm_id` | `number` | 必须为正整数（`> 0`）。当最终 `status` 为 `"included"` 时必填（若原记录已有 `bgm_id` 可省略）；`"excluded"` 不要求 `bgm_id` |
+| `reason` | `string \| null` | 排除或备注原因（省略时保留原值，显式传 `null` 时清空为 `null`） |
+| `note` | `string \| null` | 审核备注（省略时保留原值，显式传 `null` 时清空为 `null`） |
+
+**响应 200** — 返回更新后的 `MalBgmMatch` 字段以及 `hydrated` 标记：
+
+```json
+{
+  "mal_id": 52991,
+  "status": "included",
+  "source": "human",
+  "bgm_id": 400602,
+  "confidence": 1.0,
+  "candidates": null,
+  "reason": null,
+  "note": "人工绑定",
+  "error": null,
+  "updated_at": "2026-03-10T08:00:00",
+  "hydrated": true
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `hydrated` | `boolean` | 当 `status = "included"` 且成功调用 Bangumi API 同步详情时为 `true`，同步失败或未触发同步（`excluded` / `pending`）时为 `false` |
+
+**响应 400** — `status` 非法、`bgm_id <= 0`，或 `status = "included"` 时缺少 `bgm_id`  
+**响应 404** — `mal_id` 对应的匹配记录不存在
+
+---
+
+### GET /admin/export/season_mal
+
+导出 `season_mal` 中的人工干预记录（`origin = 'manual' OR is_removed = 1`），按 `season_id` 升序、`mal_id` 升序排列，以 NDJSON（Newline Delimited JSON）格式返回。数据库无符合条件记录时返回空响应体 `""`。
+
+**响应 200（`Content-Type: application/x-ndjson`）**
+
+```json
+{"season_id":202510,"mal_id":101,"origin":"manual","is_removed":false,"note":null}
+{"season_id":202601,"mal_id":101,"origin":"manual","is_removed":false,"note":"manual add"}
+{"season_id":202601,"mal_id":102,"origin":"mal","is_removed":true,"note":"wrong season"}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `season_id` | `number` | 季度 ID |
+| `mal_id` | `number` | MAL 条目 ID |
+| `origin` | `string` | 来源（`"mal"` / `"manual"`） |
+| `is_removed` | `boolean` | 是否已从该季度软移除 |
+| `note` | `string \| null` | 备注 |
+
+---
+
+### GET /admin/export/matches
+
+导出全量 `mal_bgm_matches` 匹配决策记录，按 `mal_id` 升序排列，以 NDJSON 格式返回（仅投影核心字段，不包含 `candidates`、`error`、`updated_at`）。数据库无记录时返回空响应体 `""`。
+
+**响应 200（`Content-Type: application/x-ndjson`）**
+
+```json
+{"mal_id":100,"status":"included","source":"exact","bgm_id":5001,"confidence":1.0,"reason":null,"note":"exact match"}
+{"mal_id":200,"status":"pending","source":null,"bgm_id":null,"confidence":null,"reason":null,"note":null}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `mal_id` | `number` | MAL 条目 ID |
+| `status` | `string` | 匹配状态（`pending` / `included` / `excluded`） |
+| `source` | `string \| null` | 决策来源（`rule` / `exact` / `llm` / `human`） |
+| `bgm_id` | `number \| null` | 绑定的 Bangumi subject ID |
+| `confidence` | `number \| null` | 匹配置信度 |
+| `reason` | `string \| null` | 原因（常见于 `excluded`） |
+| `note` | `string \| null` | 备注 |
+
+---
+
 ### GET /admin/subjects/{subject_id}
 
-获取番剧详情（含内部字段 `updated_at`、`last_updated_at`）。
+获取番剧详情（含 Bangumi 补充元数据与内部时间戳 `updated_at`、`last_updated_at`）。
 
 **响应 200**
 
@@ -342,6 +563,11 @@ Authorization: Bearer <ADMIN_TOKEN>
   "id": 12345,
   "name": "葬送的芙莉莲",
   "name_cn": "葬送的芙莉莲",
+  "air_date": "2023-09-29",
+  "platform": "TV",
+  "summary": "简介文本",
+  "tags": "[\"奇幻\",\"冒险\"]",
+  "nsfw": false,
   "images_grid": "https://...",
   "images_large": "https://...",
   "rank": 1,
@@ -351,8 +577,6 @@ Authorization: Bearer <ADMIN_TOKEN>
   "drop_rate": 0.03,
   "air_weekday": "星期五",
   "meta_tags": ["TV", "奇幻"],
-  "media_type": "TV",
-  "rating": "G",
   "updated_at": "2026-03-10T08:00:00",
   "last_updated_at": "2026-03-10T08:00:00Z"
 }
@@ -392,7 +616,7 @@ Authorization: Bearer <ADMIN_TOKEN>
 
 ### DELETE /admin/subjects/{subject_id}
 
-删除番剧记录（同时解除其所有季度关联）。
+删除番剧记录（在同一事务中将引用该 `bgm_id` 的 `mal_bgm_matches` 记录重置为 `status = 'pending'`、`bgm_id = null`、`source = null`、`confidence = null` 并刷新 `updated_at`）。
 
 **响应 200**
 
@@ -406,7 +630,7 @@ Authorization: Bearer <ADMIN_TOKEN>
 
 ### GET /admin/subjects/orphans
 
-查询孤儿番剧（不属于任何季度的番剧记录）。
+查询孤儿番剧（未被任何 `mal_bgm_matches.bgm_id` 引用的番剧记录）。
 
 **响应 200**
 
@@ -424,7 +648,7 @@ Authorization: Bearer <ADMIN_TOKEN>
 
 ### DELETE /admin/subjects/orphans
 
-清理所有孤儿番剧。
+清理所有孤儿番剧（排除任何 `mal_bgm_matches.bgm_id IS NOT NULL` 引用的番剧）。
 
 **响应 200**
 
@@ -505,3 +729,14 @@ Authorization: Bearer <ADMIN_TOKEN>
 | `last_stats.success_count` | `number` | 成功更新数量 |
 | `last_stats.fail_count` | `number` | 失败数量 |
 | `last_stats.elapsed_ms` | `number` | 执行耗时（毫秒） |
+
+---
+
+## 已移除或变更的接口与字段
+
+以下旧版行为/字段在当前路由与数据模型中已移除或替换：
+
+- **`subjects` 模型与 `GET /admin/subjects/{subject_id}`**：移除了 `media_type` 与 `rating` 字段（现存储于 `mal_anime` 表，仅在公开接口 `/api/seasons/{season_id}/subjects` 与 `/api/seasons/top1` 中关联并映射后输出）；同时新增 `air_date`、`platform`、`summary`、`tags`、`nsfw` 字段。
+- **公开接口 `media_type` 与 `rating` 值域**：`media_type` 不再是大写分类值（如 `"TV"`），而是保留 MAL 原始小写值（如 `"tv"`、`"ona"`、`"ova"`、`"movie"` 等）；`rating` 不再透传 `"G"` 等原始字符串，而是映射为 `general` / `kids` / `r18` 三档。
+- **`DELETE /admin/seasons/{season_id}/subjects/{subject_id}` 与 `DELETE /admin/seasons/{season_id}/subjects/{mal_id}`**：已完全移除，统一替换为 `DELETE /admin/seasons/{season_id}/mal/{mal_id}`（按 `mal_id` 将 `season_mal.is_removed` 置为 `1`）及 `POST /admin/seasons/{season_id}/mal/{mal_id}/restore`（恢复为 `is_removed = 0`）；原 `season_subjects` 表及其按 `subject_id` 增删关联的逻辑已移除。
+- **`POST /admin/seasons` 与 `POST /admin/seasons/{season_id}/sync`**：已移除阻塞式 JSON 响应（`subjects_added`、`subjects_removed`、`subjects_updated`、`subjects_failed`），统一改为 SSE (`text/event-stream`) 事件流，事件字段为 `added`、`removed`、`updated`、`failed`。

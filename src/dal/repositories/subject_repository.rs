@@ -1,19 +1,6 @@
+use super::log_db_error;
 use crate::dal::dto::{CreateSubject, Subject, UpdateSubject};
 use sqlx::SqlitePool;
-
-fn log_db_error(operation: &'static str, table: &'static str, e: &sqlx::Error) {
-    match e {
-        sqlx::Error::RowNotFound => {
-            tracing::debug!(operation, table, error = %e, "db error");
-        }
-        sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
-            tracing::warn!(operation, table, error = %e, "db error");
-        }
-        _ => {
-            tracing::error!(operation, table, error = %e, "db error");
-        }
-    }
-}
 
 pub struct SubjectRepository<'a> {
     pool: &'a SqlitePool,
@@ -30,16 +17,22 @@ impl<'a> SubjectRepository<'a> {
         let row = sqlx::query_as::<_, Subject>(
             r#"
             INSERT INTO subjects (
-                id, name, name_cn, images_grid, images_large,
-                rank, score, collection_total, average_comment,
-                drop_rate, air_weekday, meta_tags, media_type, rating)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                id, name, name_cn, air_date, platform, summary, tags, nsfw,
+                images_grid, images_large, rank, score, collection_total,
+                average_comment, drop_rate, air_weekday, meta_tags
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING *
             "#,
         )
         .bind(subject.id)
         .bind(subject.name)
         .bind(subject.name_cn)
+        .bind(subject.air_date)
+        .bind(subject.platform)
+        .bind(subject.summary)
+        .bind(subject.tags)
+        .bind(subject.nsfw)
         .bind(subject.images_grid)
         .bind(subject.images_large)
         .bind(subject.rank)
@@ -49,8 +42,6 @@ impl<'a> SubjectRepository<'a> {
         .bind(subject.drop_rate)
         .bind(subject.air_weekday)
         .bind(meta_tags_json)
-        .bind(subject.media_type)
-        .bind(subject.rating)
         .fetch_one(self.pool)
         .await?;
 
@@ -62,14 +53,19 @@ impl<'a> SubjectRepository<'a> {
         let row = sqlx::query_as::<_, Subject>(
             r#"
             INSERT INTO subjects (
-                id, name, name_cn, images_grid, images_large,
-                rank, score, collection_total, average_comment,
-                drop_rate, air_weekday, meta_tags, media_type, rating
+                id, name, name_cn, air_date, platform, summary, tags, nsfw,
+                images_grid, images_large, rank, score, collection_total,
+                average_comment, drop_rate, air_weekday, meta_tags
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (id) DO UPDATE SET
                 name = EXCLUDED.name,
                 name_cn = EXCLUDED.name_cn,
+                air_date = EXCLUDED.air_date,
+                platform = EXCLUDED.platform,
+                summary = EXCLUDED.summary,
+                tags = EXCLUDED.tags,
+                nsfw = EXCLUDED.nsfw,
                 images_grid = EXCLUDED.images_grid,
                 images_large = EXCLUDED.images_large,
                 rank = EXCLUDED.rank,
@@ -79,8 +75,6 @@ impl<'a> SubjectRepository<'a> {
                 drop_rate = EXCLUDED.drop_rate,
                 air_weekday = EXCLUDED.air_weekday,
                 meta_tags = CASE WHEN json_array_length(EXCLUDED.meta_tags) > 0 THEN EXCLUDED.meta_tags ELSE subjects.meta_tags END,
-                media_type = COALESCE(EXCLUDED.media_type, subjects.media_type),
-                rating = COALESCE(EXCLUDED.rating, subjects.rating),
                 updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
             RETURNING *
             "#,
@@ -88,6 +82,11 @@ impl<'a> SubjectRepository<'a> {
         .bind(subject.id)
         .bind(subject.name)
         .bind(subject.name_cn)
+        .bind(subject.air_date)
+        .bind(subject.platform)
+        .bind(subject.summary)
+        .bind(subject.tags)
+        .bind(subject.nsfw)
         .bind(subject.images_grid)
         .bind(subject.images_large)
         .bind(subject.rank)
@@ -97,58 +96,11 @@ impl<'a> SubjectRepository<'a> {
         .bind(subject.drop_rate)
         .bind(subject.air_weekday)
         .bind(meta_tags_json)
-        .bind(subject.media_type)
-        .bind(subject.rating)
         .fetch_one(self.pool)
         .await
         .inspect_err(|e| log_db_error("upsert", "subjects", e))?;
 
         Ok(row)
-    }
-
-    /// 只保证 subject 行存在、并刷新 media_type/rating，绝不触碰 name/rank/score 等详情字段。
-    ///
-    /// 用于全量对账：对账要为每条 entry 保证 subjects 行存在（season_subjects 有 FK），
-    /// 但绝大多数 entry 已有完整详情且本轮不会重拉，因此不能走 `upsert`
-    /// —— 那个 SQL 的 DO UPDATE 会把未提供的详情字段全部写成 NULL。
-    pub async fn upsert_meta_batch(
-        &self,
-        rows: &[(i32, Option<String>, Option<String>)],
-    ) -> Result<(), sqlx::Error> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .inspect_err(|e| log_db_error("upsert_meta_begin_tx", "subjects", e))?;
-
-        for (id, media_type, rating) in rows {
-            sqlx::query(
-                r#"
-                INSERT INTO subjects (id, media_type, rating)
-                VALUES (?, ?, ?)
-                ON CONFLICT (id) DO UPDATE SET
-                    media_type = COALESCE(EXCLUDED.media_type, subjects.media_type),
-                    rating = COALESCE(EXCLUDED.rating, subjects.rating),
-                    updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
-                "#,
-            )
-            .bind(id)
-            .bind(media_type)
-            .bind(rating)
-            .execute(&mut *tx)
-            .await
-            .inspect_err(|e| log_db_error("upsert_meta", "subjects", e))?;
-        }
-
-        tx.commit()
-            .await
-            .inspect_err(|e| log_db_error("upsert_meta_commit", "subjects", e))?;
-
-        Ok(())
     }
 
     pub async fn find_due_for_update(
@@ -159,9 +111,12 @@ impl<'a> SubjectRepository<'a> {
 
         let rows = sqlx::query_as::<_, (i32, i32, Option<chrono::DateTime<Utc>>)>(
             r#"
-            SELECT s.id, MAX(ss.season_id) as newest_season_id, s.last_updated_at
+            SELECT s.id, MAX(sm.season_id) as newest_season_id, s.last_updated_at
             FROM subjects s
-            JOIN season_subjects ss ON s.id = ss.subject_id
+            JOIN mal_bgm_matches mbm ON mbm.bgm_id = s.id
+            JOIN season_mal sm       ON sm.mal_id = mbm.mal_id
+            WHERE mbm.status = 'included'
+              AND sm.is_removed = 0
             GROUP BY s.id, s.last_updated_at
             "#,
         )
@@ -196,7 +151,10 @@ impl<'a> SubjectRepository<'a> {
             r#"
             SELECT * FROM subjects s
             WHERE NOT EXISTS (
-                SELECT 1 FROM season_subjects ss WHERE ss.subject_id = s.id
+                SELECT 1
+                FROM mal_bgm_matches mbm
+                WHERE mbm.bgm_id = s.id
+                  AND mbm.bgm_id IS NOT NULL
             )
             "#,
         )
@@ -213,7 +171,12 @@ impl<'a> SubjectRepository<'a> {
         let rows = sqlx::query_scalar::<_, i32>(
             r#"
             DELETE FROM subjects
-            WHERE id NOT IN (SELECT DISTINCT subject_id FROM season_subjects)
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM mal_bgm_matches mbm
+                WHERE mbm.bgm_id = subjects.id
+                  AND mbm.bgm_id IS NOT NULL
+            )
             RETURNING id
             "#,
         )
@@ -301,14 +264,36 @@ impl<'a> SubjectRepository<'a> {
     }
 
     pub async fn delete(&self, subject_id: i32) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            UPDATE mal_bgm_matches
+            SET
+                status = 'pending',
+                bgm_id = NULL,
+                source = NULL,
+                confidence = NULL,
+                updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
+            WHERE bgm_id = ?
+            "#,
+        )
+        .bind(subject_id)
+        .execute(&mut *tx)
+        .await
+        .inspect_err(|e| log_db_error("delete_reset_matches", "mal_bgm_matches", e))?;
+
         let result = sqlx::query(
             r#"
             DELETE FROM subjects WHERE id = ?
             "#,
         )
         .bind(subject_id)
-        .execute(self.pool)
-        .await?;
+        .execute(&mut *tx)
+        .await
+        .inspect_err(|e| log_db_error("delete", "subjects", e))?;
+
+        tx.commit().await?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -317,82 +302,55 @@ impl<'a> SubjectRepository<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dal::Database;
+    use crate::dal::dto::{CreateSeason, UpdateMalBgmMatch, UpsertMalAnime};
+    use crate::dal::repositories::{
+        MalAnimeRepository, MalBgmMatchRepository, SeasonMalRepository, SeasonRepository,
+    };
 
-    /// 全量对账的关键回归防线：upsert_meta_batch 绝不能碰详情字段。
-    /// 若退回用 `upsert(CreateSubject { id, media_type, rating, ..Default::default() })`，
-    /// 该 SQL 的 DO UPDATE 会把 name/rank/score 等全部写成 NULL，而对账不会重拉详情补回。
-    #[sqlx::test]
-    async fn test_upsert_meta_batch_preserves_existing_details(pool: SqlitePool) -> sqlx::Result<()>
-    {
-        let repo = SubjectRepository::new(&pool);
-        repo.create(CreateSubject {
-            id: 444957,
-            name: Some("燃比娃".to_string()),
-            name_cn: Some("燃比娃".to_string()),
-            images_grid: Some("grid".to_string()),
-            rank: Some(123),
-            score: Some(8.5),
-            collection_total: Some(1000),
-            average_comment: Some(4.2),
-            drop_rate: Some(0.1),
-            air_weekday: Some("星期一".to_string()),
-            meta_tags: vec!["日本".to_string()],
-            media_type: Some("tv".to_string()),
-            rating: Some("general".to_string()),
-            ..Default::default()
-        })
-        .await?;
-
-        // 上游把 media_type 从 tv 改判为 movie
-        repo.upsert_meta_batch(&[(444957, Some("movie".to_string()), None)])
+    async fn link_season_subject(
+        pool: &SqlitePool,
+        season_id: i32,
+        mal_id: i32,
+        subject_id: i32,
+        status: &str,
+        is_removed: bool,
+    ) -> sqlx::Result<()> {
+        MalAnimeRepository::new(pool)
+            .upsert(UpsertMalAnime {
+                mal_id,
+                title: format!("MAL {}", mal_id),
+                media_type: "tv".to_string(),
+                ..Default::default()
+            })
             .await?;
 
-        let s = repo.find_by_id(444957).await?.expect("subject 应存在");
-        assert_eq!(s.media_type, Some("movie".to_string()), "media_type 应被刷新");
-        assert_eq!(s.rating, Some("general".to_string()), "None 不应覆盖已有 rating");
-        assert_eq!(s.name, Some("燃比娃".to_string()));
-        assert_eq!(s.rank, Some(123));
-        assert_eq!(s.score, Some(8.5));
-        assert_eq!(s.collection_total, Some(1000));
-        assert_eq!(s.average_comment, Some(4.2));
-        assert_eq!(s.drop_rate, Some(0.1));
-        assert_eq!(s.air_weekday, Some("星期一".to_string()));
-        assert_eq!(s.meta_tags, vec!["日本".to_string()]);
-        Ok(())
-    }
+        let sm_repo = SeasonMalRepository::new(pool);
+        sm_repo.insert_ignore(season_id, mal_id).await?;
+        if is_removed {
+            sm_repo.set_removed(season_id, mal_id, true, None).await?;
+        }
 
-    #[sqlx::test]
-    async fn test_upsert_meta_batch_inserts_new_rows(pool: SqlitePool) -> sqlx::Result<()> {
-        let repo = SubjectRepository::new(&pool);
-        repo.upsert_meta_batch(&[
-            (1, Some("tv".to_string()), Some("general".to_string())),
-            (2, Some("movie".to_string()), Some("r18".to_string())),
-        ])
-        .await?;
+        MalBgmMatchRepository::new(pool)
+            .upsert(
+                mal_id,
+                UpdateMalBgmMatch {
+                    status: status.to_string(),
+                    source: Some("exact".to_string()),
+                    bgm_id: Some(subject_id),
+                    confidence: Some(1.0),
+                    ..Default::default()
+                },
+            )
+            .await?;
 
-        let a = repo.find_by_id(1).await?.expect("1 应被插入");
-        assert_eq!(a.media_type, Some("tv".to_string()));
-        assert!(a.name.is_none(), "新行是空壳，详情待 hydrate");
-        assert_eq!(a.meta_tags, Vec::<String>::new(), "meta_tags 应走表默认值 '[]'");
-
-        let b = repo.find_by_id(2).await?.expect("2 应被插入");
-        assert_eq!(b.rating, Some("r18".to_string()));
-        Ok(())
-    }
-
-    #[sqlx::test]
-    async fn test_upsert_meta_batch_empty_is_noop(pool: SqlitePool) -> sqlx::Result<()> {
-        SubjectRepository::new(&pool).upsert_meta_batch(&[]).await?;
         Ok(())
     }
 
     #[sqlx::test]
     async fn test_find_orphans(pool: SqlitePool) -> sqlx::Result<()> {
-        use crate::dal::dto::{CreateSeason, CreateSeasonSubject};
-        use crate::dal::repositories::SeasonRepository;
-        use crate::dal::repositories::SeasonSubjectRepository;
-
-        SeasonRepository::new(&pool)
+        let db = Database::from_pool(pool);
+        SeasonRepository::new(db.pool())
             .create(CreateSeason {
                 season_id: 202601,
                 year: 2026,
@@ -401,62 +359,52 @@ mod tests {
             })
             .await?;
 
-        let repo = SubjectRepository::new(&pool);
-        repo.create(CreateSubject {
-            id: 1,
-            ..Default::default()
-        })
-        .await?;
-        repo.create(CreateSubject {
-            id: 2,
-            ..Default::default()
-        })
-        .await?;
-        SeasonSubjectRepository::new(&pool)
-            .create(CreateSeasonSubject {
-                season_id: 202601,
-                subject_id: 1,
+        let repo = SubjectRepository::new(db.pool());
+        for id in [1, 2, 10, 11, 12, 13, 14] {
+            repo.create(CreateSubject {
+                id,
+                ..Default::default()
             })
             .await?;
-        SeasonSubjectRepository::new(&pool)
-            .create(CreateSeasonSubject {
-                season_id: 202601,
-                subject_id: 2,
-            })
-            .await?;
+        }
 
-        repo.create(CreateSubject {
-            id: 10,
-            ..Default::default()
-        })
-        .await?;
-        repo.create(CreateSubject {
-            id: 11,
-            ..Default::default()
-        })
-        .await?;
-        repo.create(CreateSubject {
-            id: 12,
-            ..Default::default()
-        })
-        .await?;
+        // 1: active season_mal + included match -> NOT orphan
+        link_season_subject(db.pool(), 202601, 101, 1, "included", false).await?;
+        // 2: one removed + one active, both included -> NOT orphan
+        link_season_subject(db.pool(), 202601, 102, 2, "included", true).await?;
+        link_season_subject(db.pool(), 202601, 103, 2, "included", false).await?;
+        // 10: no match -> orphan
+        // 11: active season_mal + excluded match with bgm_id -> NOT orphan (referenced by match)
+        link_season_subject(db.pool(), 202601, 111, 11, "excluded", false).await?;
+        // 12: removed season_mal + included match with bgm_id -> NOT orphan (referenced by match)
+        link_season_subject(db.pool(), 202601, 112, 12, "included", true).await?;
+        // 13: active season_mal + pending match with bgm_id -> NOT orphan (referenced by match)
+        link_season_subject(db.pool(), 202601, 113, 13, "pending", false).await?;
+        // 14: exists only alongside a match with bgm_id IS NULL -> orphan
+        MalAnimeRepository::new(db.pool())
+            .upsert(UpsertMalAnime {
+                mal_id: 114,
+                title: "MAL 114".to_string(),
+                media_type: "tv".to_string(),
+                ..Default::default()
+            })
+            .await?;
+        MalBgmMatchRepository::new(db.pool())
+            .insert_pending_ignore(114)
+            .await?;
 
         let orphans = repo.find_orphans().await?;
-        assert_eq!(orphans.len(), 3);
+        assert_eq!(orphans.len(), 2);
         let ids: Vec<i32> = orphans.iter().map(|s| s.id).collect();
         assert!(ids.contains(&10));
-        assert!(ids.contains(&11));
-        assert!(ids.contains(&12));
+        assert!(ids.contains(&14));
         Ok(())
     }
 
     #[sqlx::test]
     async fn test_delete_orphans(pool: SqlitePool) -> sqlx::Result<()> {
-        use crate::dal::dto::{CreateSeason, CreateSeasonSubject};
-        use crate::dal::repositories::SeasonRepository;
-        use crate::dal::repositories::SeasonSubjectRepository;
-
-        SeasonRepository::new(&pool)
+        let db = Database::from_pool(pool);
+        SeasonRepository::new(db.pool())
             .create(CreateSeason {
                 season_id: 202601,
                 year: 2026,
@@ -465,44 +413,53 @@ mod tests {
             })
             .await?;
 
-        let repo = SubjectRepository::new(&pool);
-        repo.create(CreateSubject {
-            id: 1,
-            ..Default::default()
-        })
-        .await?;
-        SeasonSubjectRepository::new(&pool)
-            .create(CreateSeasonSubject {
-                season_id: 202601,
-                subject_id: 1,
+        let repo = SubjectRepository::new(db.pool());
+        for id in [1, 10, 11, 12, 13] {
+            repo.create(CreateSubject {
+                id,
+                ..Default::default()
             })
             .await?;
-        repo.create(CreateSubject {
-            id: 10,
-            ..Default::default()
-        })
-        .await?;
-        repo.create(CreateSubject {
-            id: 11,
-            ..Default::default()
-        })
-        .await?;
+        }
+
+        // 1: active included -> kept
+        link_season_subject(db.pool(), 202601, 101, 1, "included", false).await?;
+        // 10: unlinked -> deleted
+        // 11: excluded with bgm_id -> kept (referenced by mal_bgm_matches)
+        link_season_subject(db.pool(), 202601, 111, 11, "excluded", false).await?;
+        // 12: removed season_mal + included with bgm_id -> kept (referenced by mal_bgm_matches)
+        link_season_subject(db.pool(), 202601, 112, 12, "included", true).await?;
+        // 13: pending with bgm_id -> kept (referenced by mal_bgm_matches)
+        link_season_subject(db.pool(), 202601, 113, 13, "pending", false).await?;
 
         let deleted = repo.delete_orphans().await?;
-        assert_eq!(deleted, 2);
+        assert_eq!(deleted, 1);
 
         let orphans = repo.find_orphans().await?;
         assert!(orphans.is_empty());
+        assert!(repo.find_by_id(1).await?.is_some());
+        assert!(repo.find_by_id(10).await?.is_none());
+        assert!(repo.find_by_id(11).await?.is_some());
+        assert!(repo.find_by_id(12).await?.is_some());
+        assert!(repo.find_by_id(13).await?.is_some());
+
+        let m11 = MalBgmMatchRepository::new(db.pool())
+            .get(111)
+            .await?
+            .unwrap();
+        assert_eq!(m11.bgm_id, Some(11));
+        let m12 = MalBgmMatchRepository::new(db.pool())
+            .get(112)
+            .await?
+            .unwrap();
+        assert_eq!(m12.bgm_id, Some(12));
         Ok(())
     }
 
     #[sqlx::test]
     async fn test_find_due_for_update(pool: SqlitePool) -> sqlx::Result<()> {
-        use crate::dal::dto::{CreateSeason, CreateSeasonSubject};
-        use crate::dal::repositories::SeasonRepository;
-        use crate::dal::repositories::SeasonSubjectRepository;
-
-        SeasonRepository::new(&pool)
+        let db = Database::from_pool(pool);
+        SeasonRepository::new(db.pool())
             .create(CreateSeason {
                 season_id: 202601,
                 year: 2026,
@@ -510,7 +467,7 @@ mod tests {
                 name: None,
             })
             .await?;
-        SeasonRepository::new(&pool)
+        SeasonRepository::new(db.pool())
             .create(CreateSeason {
                 season_id: 202504,
                 year: 2025,
@@ -519,55 +476,47 @@ mod tests {
             })
             .await?;
 
-        let repo = SubjectRepository::new(&pool);
-
-        repo.create(CreateSubject {
-            id: 1,
-            ..Default::default()
-        })
-        .await?;
-        SeasonSubjectRepository::new(&pool)
-            .create(CreateSeasonSubject {
-                season_id: 202601,
-                subject_id: 1,
+        let repo = SubjectRepository::new(db.pool());
+        for id in [1, 2, 3, 4, 5, 6] {
+            repo.create(CreateSubject {
+                id,
+                ..Default::default()
             })
             .await?;
+        }
 
-        repo.create(CreateSubject {
-            id: 2,
-            ..Default::default()
-        })
-        .await?;
-        SeasonSubjectRepository::new(&pool)
-            .create(CreateSeasonSubject {
-                season_id: 202504,
-                subject_id: 2,
-            })
-            .await?;
+        // 1: current season (202601), active included -> due
+        link_season_subject(db.pool(), 202601, 201, 1, "included", false).await?;
+
+        // 2: old season (202504), stale (4 days) -> due
+        link_season_subject(db.pool(), 202504, 202, 2, "included", false).await?;
         sqlx::query(
             "UPDATE subjects SET last_updated_at = datetime('now', '-4 days') WHERE id = ?",
         )
         .bind(2)
-        .execute(&pool)
+        .execute(db.pool())
         .await?;
 
-        repo.create(CreateSubject {
-            id: 3,
-            ..Default::default()
-        })
-        .await?;
-        SeasonSubjectRepository::new(&pool)
-            .create(CreateSeasonSubject {
-                season_id: 202504,
-                subject_id: 3,
-            })
+        // 3: old season (202504), fresh (1 day) -> NOT due
+        link_season_subject(db.pool(), 202504, 203, 3, "included", false).await?;
+        sqlx::query("UPDATE subjects SET last_updated_at = datetime('now', '-1 day') WHERE id = ?")
+            .bind(3)
+            .execute(db.pool())
             .await?;
-        sqlx::query(
-            "UPDATE subjects SET last_updated_at = datetime('now', '-1 day') WHERE id = ?",
-        )
-        .bind(3)
-        .execute(&pool)
-        .await?;
+
+        // 4: multi-season N:1 (202504 + 202601), fresh (1 day) -> MAX(season_id)=202601 -> due
+        link_season_subject(db.pool(), 202504, 204, 4, "included", false).await?;
+        link_season_subject(db.pool(), 202601, 205, 4, "included", false).await?;
+        sqlx::query("UPDATE subjects SET last_updated_at = datetime('now', '-1 day') WHERE id = ?")
+            .bind(4)
+            .execute(db.pool())
+            .await?;
+
+        // 5: removed in 202601 -> NOT due
+        link_season_subject(db.pool(), 202601, 206, 5, "included", true).await?;
+
+        // 6: excluded in 202601 -> NOT due
+        link_season_subject(db.pool(), 202601, 207, 6, "excluded", false).await?;
 
         let due = repo.find_due_for_update(202601).await?;
         let due_ids: Vec<i32> = due.iter().map(|(id, _, _)| *id).collect();
@@ -578,13 +527,29 @@ mod tests {
         );
         assert!(due_ids.contains(&2), "Subject 2 (stale) should be due");
         assert!(!due_ids.contains(&3), "Subject 3 (fresh) should NOT be due");
+        assert!(
+            due_ids.contains(&4),
+            "Subject 4 (newest season 202601) should be due"
+        );
+        assert!(
+            !due_ids.contains(&5),
+            "Subject 5 (removed) should NOT be due"
+        );
+        assert!(
+            !due_ids.contains(&6),
+            "Subject 6 (excluded) should NOT be due"
+        );
+
+        let sub4 = due.iter().find(|(id, _, _)| *id == 4).unwrap();
+        assert_eq!(sub4.1, 202601);
 
         Ok(())
     }
 
     #[sqlx::test]
     async fn test_update_last_updated_at(pool: SqlitePool) -> sqlx::Result<()> {
-        let repo = SubjectRepository::new(&pool);
+        let db = Database::from_pool(pool);
+        let repo = SubjectRepository::new(db.pool());
         repo.create(CreateSubject {
             id: 999,
             ..Default::default()
@@ -604,12 +569,18 @@ mod tests {
 
     #[sqlx::test]
     async fn test_create_subject(pool: SqlitePool) -> sqlx::Result<()> {
-        let repo = SubjectRepository::new(&pool);
+        let db = Database::from_pool(pool);
+        let repo = SubjectRepository::new(db.pool());
 
         let create_subject = CreateSubject {
             id: 515759,
             name: Some("葬送のフリーレン 第2期".to_string()),
             name_cn: Some("葬送的芙莉莲 第二季".to_string()),
+            air_date: Some("2026-01-16".to_string()),
+            platform: Some("TV".to_string()),
+            summary: Some("旅途继续".to_string()),
+            tags: Some(r#"[{"name":"奇幻","count":100}]"#.to_string()),
+            nsfw: Some(false),
             images_grid: Some(
                 "https://lain.bgm.tv/r/100/pic/cover/l/0b/24/515759_qA1Zc.jpg".to_string(),
             ),
@@ -628,13 +599,16 @@ mod tests {
             score: Some(8.155339805825243),
             average_comment: Some(0.0),
             air_weekday: Some("星期五".to_string()),
-            ..Default::default()
         };
 
         let subject = repo.create(create_subject).await?;
 
         assert_eq!(subject.id, 515759);
         assert_eq!(subject.name_cn, Some("葬送的芙莉莲 第二季".to_string()));
+        assert_eq!(subject.air_date, Some("2026-01-16".to_string()));
+        assert_eq!(subject.platform, Some("TV".to_string()));
+        assert_eq!(subject.summary, Some("旅途继续".to_string()));
+        assert_eq!(subject.nsfw, Some(false));
         assert_eq!(subject.meta_tags[0], "TV".to_string());
 
         Ok(())
@@ -642,12 +616,15 @@ mod tests {
 
     #[sqlx::test]
     async fn test_upsert_subject(pool: SqlitePool) -> sqlx::Result<()> {
-        let repo = SubjectRepository::new(&pool);
+        let db = Database::from_pool(pool);
+        let repo = SubjectRepository::new(db.pool());
 
         let create_subject = CreateSubject {
             id: 515759,
             name: Some("葬送のフリーレン 第2期".to_string()),
             name_cn: Some("葬送的芙莉莲 第二季".to_string()),
+            air_date: Some("2026-01-16".to_string()),
+            platform: Some("TV".to_string()),
             images_grid: Some(
                 "https://lain.bgm.tv/r/100/pic/cover/l/0b/24/515759_qA1Zc.jpg".to_string(),
             ),
@@ -679,6 +656,9 @@ mod tests {
             id: 515759,
             name: Some("葬送のフリーレン 第2期".to_string()),
             name_cn: Some("葬送的芙莉莲 第二季".to_string()),
+            air_date: Some("2026-01-16".to_string()),
+            platform: Some("WEB".to_string()),
+            nsfw: Some(false),
             images_grid: Some(
                 "https://lain.bgm.tv/r/100/pic/cover/l/0b/24/515759_qA1Zc.jpg".to_string(),
             ),
@@ -704,13 +684,16 @@ mod tests {
 
         assert_eq!(subject.id, 515759);
         assert_eq!(subject.rank, Some(380));
+        assert_eq!(subject.platform, Some("WEB".to_string()));
+        assert_eq!(subject.nsfw, Some(false));
 
         Ok(())
     }
 
     #[sqlx::test]
     async fn test_find_subject_by_id(pool: SqlitePool) -> sqlx::Result<()> {
-        let repo = SubjectRepository::new(&pool);
+        let db = Database::from_pool(pool);
+        let repo = SubjectRepository::new(db.pool());
 
         let create_subject = CreateSubject {
             id: 443106,
@@ -755,7 +738,8 @@ mod tests {
 
     #[sqlx::test]
     async fn test_update_subject(pool: SqlitePool) -> sqlx::Result<()> {
-        let repo = SubjectRepository::new(&pool);
+        let db = Database::from_pool(pool);
+        let repo = SubjectRepository::new(db.pool());
 
         let create_subject = CreateSubject {
             id: 517057,
@@ -810,7 +794,8 @@ mod tests {
 
     #[sqlx::test]
     async fn test_score_float_precision_survives_roundtrip(pool: SqlitePool) -> sqlx::Result<()> {
-        let repo = SubjectRepository::new(&pool);
+        let db = Database::from_pool(pool);
+        let repo = SubjectRepository::new(db.pool());
 
         let score = 8.123456f64;
         repo.create(CreateSubject {
@@ -832,7 +817,8 @@ mod tests {
 
     #[sqlx::test]
     async fn test_delete_subject(pool: SqlitePool) -> sqlx::Result<()> {
-        let repo = SubjectRepository::new(&pool);
+        let db = Database::from_pool(pool);
+        let repo = SubjectRepository::new(db.pool());
 
         let create_subject = CreateSubject {
             id: 548818,
@@ -863,11 +849,56 @@ mod tests {
 
         let result = repo.delete(548818).await?;
 
-        assert_eq!(result, true);
+        assert!(result);
 
         let not_found = repo.find_by_id(548818).await?;
 
         assert!(not_found.is_none());
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_delete_subject_resets_referencing_matches(pool: SqlitePool) -> sqlx::Result<()> {
+        let db = Database::from_pool(pool);
+        SeasonRepository::new(db.pool())
+            .create(CreateSeason {
+                season_id: 202601,
+                year: 2026,
+                season: "WINTER".to_string(),
+                name: None,
+            })
+            .await?;
+
+        let repo = SubjectRepository::new(db.pool());
+        repo.create(CreateSubject {
+            id: 548818,
+            ..Default::default()
+        })
+        .await?;
+
+        link_season_subject(db.pool(), 202601, 9001, 548818, "included", false).await?;
+        link_season_subject(db.pool(), 202601, 9002, 548818, "excluded", false).await?;
+
+        let match_repo = MalBgmMatchRepository::new(db.pool());
+        let before_9001 = match_repo.get(9001).await?.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        assert!(repo.delete(548818).await?);
+        assert!(repo.find_by_id(548818).await?.is_none());
+
+        for mal_id in [9001, 9002] {
+            let m = match_repo.get(mal_id).await?.unwrap();
+            assert_eq!(m.status, "pending");
+            assert_eq!(m.bgm_id, None);
+            assert_eq!(m.source, None);
+            assert_eq!(m.confidence, None);
+            assert!(m.updated_at > before_9001.updated_at);
+        }
+
+        // Deleting non-existent subject returns false
+        assert!(!repo.delete(548818).await?);
 
         Ok(())
     }

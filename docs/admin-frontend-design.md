@@ -148,7 +148,7 @@
 3. **MAL 标错季度 · 跨季移番 (`[M]` 键)**
    - 专门对应第一步的 `season_mal` 表操作！
    - 按 `M` 弹出季度快速选择器，置顶显示 **`[← 上一季 2025 Fall]`** 与 **`[→ 下一季 2026 Spring]`**（也可搜索任意季度）。
-   - 选中后调用 `POST /admin/seasons/{id}/mal-items/{mal_id}/move`：本季 `season_mal.is_removed = 1`，目标季插入 `season_mal` 记录。**如果该番已有绑定的 `bgm_id`，匹配关系自动带过去，无需重审！**
+   - 选中后调用 `POST /admin/seasons/{id}/mal/{mal_id}/move`：本季 `season_mal.is_removed = 1`，目标季插入 `season_mal` 记录。**如果该番已有绑定的 `bgm_id`，匹配关系自动带过去，无需重审！**
 
 ---
 

@@ -6,7 +6,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 
-use crate::core::sync::SyncService;
 use crate::dal::Database;
 use crate::services::bangumi::BangumiClient;
 use crate::services::deploy_hook::DeployHookClient;
@@ -100,8 +99,6 @@ pub(super) struct TickStats {
     pub due_count: usize,
     pub success_count: usize,
     pub fail_count: usize,
-    pub reconciled_added: usize,
-    pub reconciled_removed: usize,
     pub elapsed_ms: u64,
 }
 
@@ -113,8 +110,6 @@ pub struct PublicTickStats {
     pub due_count: usize,
     pub success_count: usize,
     pub fail_count: usize,
-    pub reconciled_added: usize,
-    pub reconciled_removed: usize,
     pub elapsed_ms: u64,
 }
 
@@ -149,28 +144,24 @@ pub struct SchedulerService {
     db: Arc<Database>,
     bangumi_client: BangumiClient,
     deploy_hook_client: DeployHookClient,
-    sync_service: Arc<SyncService>,
     handle: SchedulerHandle,
 }
 
 impl SchedulerService {
     #[allow(dead_code)]
     pub fn new(db: Arc<Database>) -> Self {
-        let sync_service = Arc::new(SyncService::new(Arc::clone(&db)));
-        Self::new_with_deploy_hook(db, None, sync_service, SchedulerHandle::new())
+        Self::new_with_deploy_hook(db, None, SchedulerHandle::new())
     }
 
     pub fn new_with_deploy_hook(
         db: Arc<Database>,
         deploy_hook_url: Option<String>,
-        sync_service: Arc<SyncService>,
         handle: SchedulerHandle,
     ) -> Self {
         Self {
             db,
             bangumi_client: BangumiClient::new(),
             deploy_hook_client: DeployHookClient::new(deploy_hook_url),
-            sync_service,
             handle,
         }
     }
@@ -213,7 +204,6 @@ impl SchedulerService {
                 &self.db,
                 &self.bangumi_client,
                 &self.deploy_hook_client,
-                &self.sync_service,
                 &self.handle,
                 tick_count,
                 !is_manual,
@@ -227,7 +217,6 @@ pub(super) async fn run_tick(
     db: &Arc<Database>,
     bangumi_client: &BangumiClient,
     deploy_hook_client: &DeployHookClient,
-    sync_service: &SyncService,
     handle: &SchedulerHandle,
     tick_count: u64,
     trigger_deploy: bool,
@@ -243,26 +232,12 @@ pub(super) async fn run_tick(
     let pool = db.pool();
     let subject_repo = SubjectRepository::new(pool);
 
-    // 全量对账：以 season-data.json 为准校正成员关系。
-    // 失败不中断本次 tick 的其余工作（评分刷新与对账互相独立）。
-    let (reconciled_added, reconciled_removed) = match sync_service.reconcile_all().await {
-        Ok(r) => (r.total_added, r.total_removed),
-        Err(e) => {
-            tracing::warn!(tick = tick_count, error = %format!("{:#}", e), "调度器全量对账失败");
-            (0, 0)
-        }
-    };
-
     let due_subjects = match subject_repo.find_due_for_update(current_season_id).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(tick = tick_count, event_type = "error", error = %e, "find_due_for_update 失败");
             handle.is_running.store(false, Ordering::SeqCst);
-            return TickStats {
-                reconciled_added,
-                reconciled_removed,
-                ..Default::default()
-            };
+            return TickStats::default();
         }
     };
 
@@ -275,8 +250,6 @@ pub(super) async fn run_tick(
 
     let mut stats = TickStats {
         due_count: due_subjects.len(),
-        reconciled_added,
-        reconciled_removed,
         ..Default::default()
     };
 
@@ -321,10 +294,11 @@ pub(super) async fn run_tick(
         tracing::warn!(current_season_id, error = %e, "调度器 touch_updated_at 失败");
     }
 
-    // 成员关系变更也会改变线上数据，同样需要触发部署
-    let has_changes =
-        stats.success_count > 0 || stats.reconciled_added > 0 || stats.reconciled_removed > 0;
-    if trigger_deploy && has_changes && let Err(e) = deploy_hook_client.trigger().await {
+    let has_changes = stats.success_count > 0;
+    if trigger_deploy
+        && has_changes
+        && let Err(e) = deploy_hook_client.trigger().await
+    {
         tracing::error!(error = %e, "Deploy Hook 触发失败");
     }
 
@@ -334,8 +308,6 @@ pub(super) async fn run_tick(
         due = stats.due_count,
         success = stats.success_count,
         fail = stats.fail_count,
-        reconciled_added = stats.reconciled_added,
-        reconciled_removed = stats.reconciled_removed,
         elapsed_ms = stats.elapsed_ms,
         event_type = "complete",
         "scheduler tick"
@@ -347,8 +319,6 @@ pub(super) async fn run_tick(
         due_count: stats.due_count,
         success_count: stats.success_count,
         fail_count: stats.fail_count,
-        reconciled_added: stats.reconciled_added,
-        reconciled_removed: stats.reconciled_removed,
         elapsed_ms: stats.elapsed_ms,
     };
     if let Ok(mut guard) = handle.last_stats.lock() {
@@ -395,12 +365,8 @@ mod tests {
     #[test]
     fn test_scheduler_new_accepts_deploy_hook_url() {
         // 编译期验证 new_with_deploy_hook 函数签名存在且类型匹配
-        let _f: fn(
-            Arc<Database>,
-            Option<String>,
-            Arc<SyncService>,
-            SchedulerHandle,
-        ) -> SchedulerService = SchedulerService::new_with_deploy_hook;
+        let _f: fn(Arc<Database>, Option<String>, SchedulerHandle) -> SchedulerService =
+            SchedulerService::new_with_deploy_hook;
     }
 
     // T004 🔴 → T005 🟢

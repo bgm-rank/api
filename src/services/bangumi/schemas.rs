@@ -103,8 +103,10 @@ pub struct Rating {
 // 标签
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tag {
+    #[serde(default)]
     pub name: Option<String>, // 标签名称
-    pub count: Option<i32>,   // 标签数量
+    #[serde(default)]
+    pub count: Option<i32>, // 标签数量
 }
 
 // 条目信息
@@ -113,23 +115,40 @@ pub struct Subject {
     pub id: i32,
     #[serde(rename = "type")]
     pub _type: i32, // 1=book, 2=anime, 3=music, 4=game, 6=real
-    pub name: Option<String>,              // 条目名称
-    pub name_cn: Option<String>,           // 条目中文名称
-    pub summary: Option<String>,           // 简介
-    pub series: Option<bool>,              // 是否为系列
-    pub nsfw: Option<bool>,                // 是否包含NSFW内容
-    pub locked: Option<bool>,              // 是否锁定
-    pub date: Option<String>,              // 上映日期 YYYY-MM-DD 格式
-    pub platform: Option<String>,          // 播放平台 TV, Web, 欧美剧, DLC...
-    pub images: Option<Images>,            // 图片
+    #[serde(default)]
+    pub name: Option<String>, // 条目名称
+    #[serde(default)]
+    pub name_cn: Option<String>, // 条目中文名称
+    #[serde(default)]
+    pub summary: Option<String>, // 简介
+    #[serde(default)]
+    pub series: Option<bool>, // 是否为系列
+    #[serde(default)]
+    pub nsfw: Option<bool>, // 是否包含NSFW内容
+    #[serde(default)]
+    pub locked: Option<bool>, // 是否锁定
+    #[serde(default)]
+    pub date: Option<String>, // 上映日期 YYYY-MM-DD 格式
+    #[serde(default)]
+    pub platform: Option<String>, // 播放平台 TV, Web, 欧美剧, DLC...
+    #[serde(default)]
+    pub images: Option<Images>, // 图片
+    #[serde(default)]
     pub infobox: Option<Vec<InfoboxItem>>, // 信息框
-    pub volumes: Option<i32>,              // 卷数
-    pub eps: Option<i32>,                  // 集数
-    pub total_episodes: Option<i32>,       // 总集数
-    pub rating: Option<Rating>,            // 评分
-    pub collection: Option<Collection>,    // 收藏
-    pub meta_tags: Option<Vec<String>>,    // 元标签
-    pub tags: Option<Vec<Tag>>,            // 标签
+    #[serde(default)]
+    pub volumes: Option<i32>, // 卷数
+    #[serde(default)]
+    pub eps: Option<i32>, // 集数
+    #[serde(default)]
+    pub total_episodes: Option<i32>, // 总集数
+    #[serde(default)]
+    pub rating: Option<Rating>, // 评分
+    #[serde(default)]
+    pub collection: Option<Collection>, // 收藏
+    #[serde(default)]
+    pub meta_tags: Option<Vec<String>>, // 元标签
+    #[serde(default)]
+    pub tags: Option<Vec<Tag>>, // 标签
 }
 
 // 搜索筛选器

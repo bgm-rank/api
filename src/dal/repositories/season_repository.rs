@@ -242,7 +242,7 @@ mod tests {
 
         let season_id = 202510;
         let create_season = CreateSeason {
-            season_id: season_id,
+            season_id,
             year: 2025,
             season: "AUTUMN".to_string(),
             name: Some("2025年秋季番".to_string()),
@@ -332,7 +332,7 @@ mod tests {
 
         let result = repo.delete(202410).await?;
 
-        assert_eq!(result, true);
+        assert!(result);
 
         let deleted = repo.find_by_id(202410).await?;
 

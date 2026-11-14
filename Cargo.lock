@@ -147,7 +147,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
- "uuid",
 ]
 
 [[package]]

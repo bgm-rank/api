@@ -1,21 +1,34 @@
 use anyhow::{Context, Result, anyhow};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::dal::{CreateSeason, CreateSubject, Database};
-use crate::dal::{SeasonRepository, SeasonSubjectRepository, SubjectRepository};
+use crate::dal::{SeasonRepository, SubjectRepository};
 use crate::services::bangumi::schemas::{Collection, Episode, InfoboxItem};
 use crate::services::bangumi::{BangumiClient, Subject as BangumiSubject};
-use crate::services::season_data::{MediaType, Rating, SeasonDataClient, SeasonEntry};
 
 pub enum SyncProgressEvent {
-    Progress { total: usize, done: usize, subject_id: i32 },
-    Done { season_id: i32, added: usize, removed: usize, updated: usize, failed: usize },
-    Error { message: String },
+    Progress {
+        total: usize,
+        done: usize,
+        subject_id: i32,
+    },
+    Done {
+        season_id: i32,
+        added: usize,
+        removed: usize,
+        updated: usize,
+        failed: usize,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct SyncResult {
     pub season_id: i32,
     pub added: usize,
@@ -24,33 +37,42 @@ pub struct SyncResult {
     pub failed: usize,
 }
 
+const DEFAULT_HYDRATE_DELAY: Duration = Duration::from_millis(500);
+
 pub struct SyncService {
-    season_data_client: SeasonDataClient,
     bangumi_client: BangumiClient,
     db: Arc<Database>,
+    hydrate_delay: Duration,
 }
 
 impl SyncService {
     pub fn new(db: Arc<Database>) -> Self {
         Self {
-            season_data_client: SeasonDataClient::new(),
             bangumi_client: BangumiClient::new(),
             db,
+            hydrate_delay: DEFAULT_HYDRATE_DELAY,
         }
     }
 
-    /// 注入自定义 client，供测试指向 mock server
+    /// 注入自定义 client，供测试指向 mock server（测试默认零延迟）
     #[cfg(test)]
-    pub fn with_clients(
-        db: Arc<Database>,
-        season_data_client: SeasonDataClient,
-        bangumi_client: BangumiClient,
-    ) -> Self {
+    pub fn with_clients(db: Arc<Database>, bangumi_client: BangumiClient) -> Self {
         Self {
-            season_data_client,
             bangumi_client,
             db,
+            hydrate_delay: Duration::ZERO,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_hydrate_delay(mut self, delay: Duration) -> Self {
+        self.hydrate_delay = delay;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn hydrate_delay(&self) -> Duration {
+        self.hydrate_delay
     }
 
     pub async fn create_and_sync(
@@ -64,7 +86,6 @@ impl SyncService {
         // T015: sync started log
         tracing::info!(season_id = %season_id, operation = "create", "sync started");
         let season_str = month_to_season(month)?;
-        let key = format!("{}-{}", year, season_str.to_lowercase());
         let pool = self.db.pool();
 
         // 1. Upsert Season
@@ -78,11 +99,13 @@ impl SyncService {
             .await
             .context("upsert season 失败")?;
 
-        self.sync_season_data(season_id, &key, progress_tx).await.map_err(|e| {
-            // T017: sync failed log
-            tracing::error!(season_id = %season_id, error = %format!("{:#}", e), "sync failed");
-            e
-        })
+        self.sync_season_subjects(season_id, progress_tx)
+            .await
+            .map_err(|e| {
+                // T017: sync failed log
+                tracing::error!(season_id = %season_id, error = %format!("{:#}", e), "sync failed");
+                e
+            })
     }
 
     pub async fn resync(
@@ -90,74 +113,107 @@ impl SyncService {
         season_id: i32,
         progress_tx: Option<mpsc::Sender<SyncProgressEvent>>,
     ) -> Result<SyncResult> {
+        let mut seen_bgm_ids = HashSet::new();
+        let mut has_hydrated = false;
+        self.resync_in_batch(season_id, &mut seen_bgm_ids, &mut has_hydrated, progress_tx)
+            .await
+    }
+
+    /// Re-syncs a single season as part of a multi-season batch, skipping `bgm_id`s
+    /// already present in `seen_bgm_ids` and sleeping `hydrate_delay` between hydrate calls.
+    pub async fn resync_in_batch(
+        &self,
+        season_id: i32,
+        seen_bgm_ids: &mut HashSet<i32>,
+        has_hydrated: &mut bool,
+        progress_tx: Option<mpsc::Sender<SyncProgressEvent>>,
+    ) -> Result<SyncResult> {
         // T015: sync started log
         tracing::info!(season_id = %season_id, operation = "resync", "sync started");
         let pool = self.db.pool();
-        let season = SeasonRepository::new(pool)
+        SeasonRepository::new(pool)
             .find_by_id(season_id)
             .await?
             .ok_or_else(|| anyhow!("Season {} not found", season_id))?;
 
-        let month = season_id % 100;
-        let season_str = month_to_season(month)?;
-        let key = format!("{}-{}", season.year, season_str.to_lowercase());
-
-        self.sync_season_data(season_id, &key, progress_tx).await.map_err(|e| {
-            // T017: sync failed log
-            tracing::error!(season_id = %season_id, error = %format!("{:#}", e), "sync failed");
-            e
-        })
+        self.sync_season_subjects_in_batch(season_id, seen_bgm_ids, has_hydrated, progress_tx)
+            .await
+            .map_err(|e| {
+                // T017: sync failed log
+                tracing::error!(season_id = %season_id, error = %format!("{:#}", e), "sync failed");
+                e
+            })
     }
 
-    async fn sync_season_data(
+    async fn sync_season_subjects(
         &self,
         season_id: i32,
-        key: &str,
+        progress_tx: Option<mpsc::Sender<SyncProgressEvent>>,
+    ) -> Result<SyncResult> {
+        let mut seen_bgm_ids = HashSet::new();
+        let mut has_hydrated = false;
+        self.sync_season_subjects_in_batch(
+            season_id,
+            &mut seen_bgm_ids,
+            &mut has_hydrated,
+            progress_tx,
+        )
+        .await
+    }
+
+    async fn sync_season_subjects_in_batch(
+        &self,
+        season_id: i32,
+        seen_bgm_ids: &mut HashSet<i32>,
+        has_hydrated: &mut bool,
         progress_tx: Option<mpsc::Sender<SyncProgressEvent>>,
     ) -> Result<SyncResult> {
         let start = std::time::Instant::now();
         let pool = self.db.pool();
 
-        // 2. Fetch season data
-        let entries = self.season_data_client.fetch_season(key).await?;
+        let mut bgm_ids = sqlx::query_scalar::<_, i32>(
+            r#"
+            SELECT DISTINCT mbm.bgm_id
+            FROM season_mal sm
+            JOIN mal_bgm_matches mbm ON mbm.mal_id = sm.mal_id
+            WHERE sm.season_id = ?
+              AND sm.is_removed = 0
+              AND mbm.status = 'included'
+              AND mbm.bgm_id IS NOT NULL
+            ORDER BY mbm.bgm_id ASC
+            "#,
+        )
+        .bind(season_id)
+        .fetch_all(pool)
+        .await
+        .context("查询待同步 bgm_id 列表失败")?;
 
-        // 3. Upsert subjects with media_type/rating from season data
-        let subject_repo = SubjectRepository::new(pool);
-        let bgm_ids: Vec<i32> = entries.iter().map(|e| e.bgm_id).collect();
+        bgm_ids.retain(|id| seen_bgm_ids.insert(*id));
 
-        for entry in &entries {
-            let _ = subject_repo
-                .upsert(CreateSubject {
-                    id: entry.bgm_id,
-                    media_type: Some(media_type_to_str(&entry.media_type).to_string()),
-                    rating: Some(rating_to_str(&entry.rating).to_string()),
-                    ..Default::default()
-                })
-                .await;
-        }
-
-        // 4. Reconcile season_subjects
-        let (added_ids, removed_ids) = SeasonSubjectRepository::new(pool)
-            .reconcile(season_id, bgm_ids)
-            .await
-            .context("reconcile 失败")?;
-        let (added, removed) = (added_ids.len(), removed_ids.len());
-
-        // 5. Fetch Bangumi details per subject
         let mut updated = 0usize;
         let mut failed = 0usize;
         let today = chrono::Utc::now().date_naive();
-        let total = entries.len();
-        let mut done = 0usize;
+        let total = bgm_ids.len();
 
-        for entry in &entries {
-            match self.hydrate_subject(entry.bgm_id, today).await {
+        for (idx, bgm_id) in bgm_ids.into_iter().enumerate() {
+            if *has_hydrated && !self.hydrate_delay.is_zero() {
+                tokio::time::sleep(self.hydrate_delay).await;
+            }
+            *has_hydrated = true;
+
+            match self.hydrate_subject(bgm_id, today).await {
                 Ok(()) => updated += 1,
                 Err(_) => failed += 1,
             }
-            done += 1;
+            let done = idx + 1;
             if let Some(tx) = &progress_tx {
-                let _ = tx.send(SyncProgressEvent::Progress { total, done, subject_id: entry.bgm_id }).await;
+                let _ = tx
+                    .send(SyncProgressEvent::Progress {
+                        total,
+                        done,
+                        subject_id: bgm_id,
+                    })
+                    .await;
             }
         }
 
@@ -170,16 +226,24 @@ impl SyncService {
         }
 
         if let Some(tx) = &progress_tx {
-            let _ = tx.send(SyncProgressEvent::Done { season_id, added, removed, updated, failed }).await;
+            let _ = tx
+                .send(SyncProgressEvent::Done {
+                    season_id,
+                    added: 0,
+                    removed: 0,
+                    updated,
+                    failed,
+                })
+                .await;
         }
 
         // T016: sync completed log
         let elapsed_ms = start.elapsed().as_millis() as u64;
         tracing::info!(
             season_id = %season_id,
-            added,
+            added = 0usize,
             updated,
-            deleted = removed,
+            deleted = 0usize,
             failed,
             elapsed_ms,
             "sync completed"
@@ -187,8 +251,8 @@ impl SyncService {
 
         Ok(SyncResult {
             season_id,
-            added,
-            removed,
+            added: 0,
+            removed: 0,
             updated,
             failed,
         })
@@ -198,7 +262,7 @@ impl SyncService {
     ///
     /// episodes 拉取失败降级为 None（不算失败）；subject 拉取或 upsert 失败返回 Err。
     /// 错误已在内部记日志，调用方只需计数。
-    async fn hydrate_subject(&self, bgm_id: i32, today: chrono::NaiveDate) -> Result<()> {
+    pub async fn hydrate_subject(&self, bgm_id: i32, today: chrono::NaiveDate) -> Result<()> {
         let avg_comment = match self.bangumi_client.get_episodes(bgm_id, 0, 100, 0).await {
             Ok(paged) => calculate_average_comment(&paged.data, today),
             Err(e) => {
@@ -215,166 +279,18 @@ impl SyncService {
             }
         };
 
-        SubjectRepository::new(self.db.pool())
-            .upsert(to_create_subject(bgm_subject, avg_comment))
+        let repo = SubjectRepository::new(self.db.pool());
+        repo.upsert(to_create_subject(bgm_subject, avg_comment))
             .await
             .inspect_err(|e| {
                 tracing::error!(subject_id = bgm_id, error = %e, "upsert subject 失败");
             })?;
 
+        if let Err(e) = repo.update_last_updated_at(bgm_id).await {
+            tracing::warn!(subject_id = bgm_id, error = %e, "update_last_updated_at 失败");
+        }
+
         Ok(())
-    }
-
-    /// 全量对账：以 season-data.json 的 key 为准，把每个季度的成员关系校正到与上游一致。
-    ///
-    /// 与 `sync_season_data` 的区别：只对**新进来的**条目拉 Bangumi 详情，已有条目不重拉评分。
-    /// 成本 = 1 次 HTTP + 一轮本地 DB 写 + 「新增条目数」次 Bangumi 请求。
-    pub async fn reconcile_all(&self) -> Result<ReconcileAllResult> {
-        let start = std::time::Instant::now();
-        let today = chrono::Utc::now().date_naive();
-
-        let all = self
-            .season_data_client
-            .fetch_all()
-            .await
-            .context("拉取 season-data.json 失败")?;
-
-        let mut result = ReconcileAllResult {
-            seasons_total: all.len(),
-            ..Default::default()
-        };
-
-        // 按 season_id 倒序遍历：最近的季度先对账。
-        // 上游审核也是倒序进行的，跨季度改判几乎都落在近几季；
-        // 而首次跑要回填全部历史时耗时以小时计，倒序能保证中途被打断也已修好要紧的季度。
-        let mut keys: Vec<(i32, &String)> = Vec::new();
-        for key in all.keys() {
-            match season_key_to_id(key) {
-                Some(season_id) => keys.push((season_id, key)),
-                None => {
-                    tracing::warn!(key = %key, "无法解析 season key，跳过");
-                    result.seasons_skipped += 1;
-                }
-            }
-        }
-        keys.sort_unstable_by(|a, b| b.cmp(a));
-
-        for (season_id, key) in keys {
-            let entries = &all[key];
-
-            // 注意事项 3：上游会把没有 included 条目的季度也铺成空数组。
-            // 对这种 key 跑 reconcile 会把该季度成员全删光，宁可漏同步也别清空一整季。
-            if entries.is_empty() {
-                tracing::warn!(season_id, key = %key, "上游季度为空数组，跳过以免清空成员");
-                result.seasons_skipped += 1;
-                continue;
-            }
-
-            match self.reconcile_one(season_id, key, entries, today).await {
-                Ok(detail) => {
-                    result.total_added += detail.added.len();
-                    result.total_removed += detail.removed.len();
-                    result.hydrate_failed += detail.hydrate_failed;
-                    if !detail.added.is_empty() || !detail.removed.is_empty() {
-                        result.changes.push(detail);
-                    }
-                }
-                Err(e) => {
-                    // 单季失败不中断整轮
-                    tracing::error!(season_id, key = %key, error = %format!("{:#}", e), "对账季度失败");
-                    result.seasons_failed += 1;
-                }
-            }
-        }
-
-        result.elapsed_ms = start.elapsed().as_millis() as u64;
-        tracing::info!(
-            seasons_total = result.seasons_total,
-            seasons_skipped = result.seasons_skipped,
-            seasons_failed = result.seasons_failed,
-            added = result.total_added,
-            removed = result.total_removed,
-            hydrate_failed = result.hydrate_failed,
-            elapsed_ms = result.elapsed_ms,
-            "reconcile_all completed"
-        );
-
-        Ok(result)
-    }
-
-    async fn reconcile_one(
-        &self,
-        season_id: i32,
-        key: &str,
-        entries: &[SeasonEntry],
-        today: chrono::NaiveDate,
-    ) -> Result<SeasonReconcileDetail> {
-        use tokio::time::{Duration, sleep};
-
-        let pool = self.db.pool();
-        let month = season_id % 100;
-
-        // 注意事项 2：以 JSON 的 key 为准 upsert season，库里没有的季度也能建出来。
-        // upsert 的 name 有 COALESCE 保护，不会清掉已有季度名。
-        SeasonRepository::new(pool)
-            .upsert(CreateSeason {
-                season_id,
-                year: season_id / 100,
-                season: month_to_season(month)?,
-                name: None,
-            })
-            .await
-            .context("upsert season 失败")?;
-
-        // 保证 subjects 行存在（season_subjects 有 FK），并刷新 media_type/rating。
-        // 这里绝不能用 SubjectRepository::upsert —— 那会把已有条目的详情清成 NULL。
-        let meta_rows: Vec<(i32, Option<String>, Option<String>)> = entries
-            .iter()
-            .map(|e| {
-                (
-                    e.bgm_id,
-                    Some(media_type_to_str(&e.media_type).to_string()),
-                    Some(rating_to_str(&e.rating).to_string()),
-                )
-            })
-            .collect();
-        SubjectRepository::new(pool)
-            .upsert_meta_batch(&meta_rows)
-            .await
-            .context("upsert_meta_batch 失败")?;
-
-        let bgm_ids: Vec<i32> = entries.iter().map(|e| e.bgm_id).collect();
-        let (added, removed) = SeasonSubjectRepository::new(pool)
-            .reconcile(season_id, bgm_ids)
-            .await
-            .context("reconcile 失败")?;
-
-        if !removed.is_empty() {
-            tracing::warn!(season_id, key = %key, ids = ?removed, "对账删除成员");
-        }
-
-        // 只有新进来的条目在库里是空壳，必须补详情
-        let mut hydrate_failed = 0usize;
-        for &bgm_id in &added {
-            if self.hydrate_subject(bgm_id, today).await.is_err() {
-                hydrate_failed += 1;
-            }
-            sleep(Duration::from_millis(500)).await;
-        }
-
-        if !added.is_empty() || !removed.is_empty() {
-            tracing::info!(season_id, key = %key, added = ?added, removed = ?removed, "对账季度完成");
-            if let Err(e) = SeasonRepository::new(pool).touch_updated_at(season_id).await {
-                tracing::warn!(season_id, error = %e, "touch_updated_at 失败");
-            }
-        }
-
-        Ok(SeasonReconcileDetail {
-            season_id,
-            added,
-            removed,
-            hydrate_failed,
-        })
     }
 
     pub async fn find_orphans(&self) -> Result<Vec<OrphanSubjectItem>> {
@@ -421,27 +337,6 @@ pub struct OrphanSubjectItem {
     pub name_cn: Option<String>,
 }
 
-#[derive(Debug, Default)]
-pub struct ReconcileAllResult {
-    pub seasons_total: usize,
-    pub seasons_skipped: usize,
-    pub seasons_failed: usize,
-    pub total_added: usize,
-    pub total_removed: usize,
-    pub hydrate_failed: usize,
-    pub elapsed_ms: u64,
-    /// 只收 added / removed 非空的季度
-    pub changes: Vec<SeasonReconcileDetail>,
-}
-
-#[derive(Debug)]
-pub struct SeasonReconcileDetail {
-    pub season_id: i32,
-    pub added: Vec<i32>,
-    pub removed: Vec<i32>,
-    pub hydrate_failed: usize,
-}
-
 fn month_to_season(month: i32) -> Result<String> {
     match month {
         1 => Ok("WINTER".to_string()),
@@ -469,28 +364,6 @@ pub(crate) fn season_key_to_id(key: &str) -> Option<i32> {
         _ => return None,
     };
     Some(year * 100 + month)
-}
-
-fn media_type_to_str(mt: &MediaType) -> &'static str {
-    match mt {
-        MediaType::Tv => "tv",
-        MediaType::Movie => "movie",
-        MediaType::Ova => "ova",
-        MediaType::Ona => "ona",
-        MediaType::TvSpecial => "tv_special",
-        MediaType::Special => "special",
-        MediaType::Music => "music",
-        MediaType::Pv => "pv",
-        MediaType::Cm => "cm",
-    }
-}
-
-fn rating_to_str(r: &Rating) -> &'static str {
-    match r {
-        Rating::General => "general",
-        Rating::Kids => "kids",
-        Rating::R18 => "r18",
-    }
 }
 
 fn normalize_rank(rank: Option<i32>) -> Option<i32> {
@@ -573,11 +446,20 @@ pub(crate) fn to_create_subject(s: BangumiSubject, avg_comment: Option<f64>) -> 
         .map(|c| c.wish + c.collect + c.doing + c.on_hold + c.dropped);
     let air_weekday = s.infobox.as_deref().and_then(extract_air_weekday);
     let meta_tags = dedup_preserving_order(s.meta_tags.unwrap_or_default());
+    let tags = s.tags.map(|tags| {
+        let names: Vec<String> = tags.into_iter().filter_map(|t| t.name).collect();
+        serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string())
+    });
 
     CreateSubject {
         id: s.id,
         name: s.name,
         name_cn: s.name_cn,
+        air_date: s.date,
+        platform: s.platform,
+        summary: s.summary,
+        tags,
+        nsfw: s.nsfw,
         images_grid: s.images.as_ref().and_then(|i| i.grid.clone()),
         images_large: s.images.and_then(|i| i.large),
         rank,
@@ -587,7 +469,6 @@ pub(crate) fn to_create_subject(s: BangumiSubject, avg_comment: Option<f64>) -> 
         drop_rate,
         air_weekday,
         meta_tags,
-        ..Default::default()
     }
 }
 
@@ -1202,26 +1083,6 @@ mod tests {
         );
     }
 
-    // ── 补充测试：杀死 media_type_to_str / rating_to_str 返回值变异体 ──
-
-    #[test]
-    fn test_media_type_to_str_returns_correct_values() {
-        use crate::services::season_data::MediaType;
-        assert_eq!(media_type_to_str(&MediaType::Tv), "tv");
-        assert_eq!(media_type_to_str(&MediaType::Movie), "movie");
-        assert_eq!(media_type_to_str(&MediaType::Ova), "ova");
-        assert_eq!(media_type_to_str(&MediaType::Ona), "ona");
-        assert_eq!(media_type_to_str(&MediaType::TvSpecial), "tv_special");
-    }
-
-    #[test]
-    fn test_rating_to_str_returns_correct_values() {
-        use crate::services::season_data::Rating as SeasonRating;
-        assert_eq!(rating_to_str(&SeasonRating::General), "general");
-        assert_eq!(rating_to_str(&SeasonRating::Kids), "kids");
-        assert_eq!(rating_to_str(&SeasonRating::R18), "r18");
-    }
-
     // ── 补充测试：杀死 calculate_average_comment L319 / → * 变异体 ──
 
     #[test]
@@ -1342,201 +1203,356 @@ mod tests {
         assert_eq!(season_key_to_id(""), None);
     }
 
-    // ── reconcile_all ─────────────────────────────────────────────────────────
+    // ── to_create_subject 扩展字段测试 ────────────────────────────────────────
 
-    /// 一整套 mock 环境。mockito 1.x 的 `Mock` 在 drop 时会从 server 上摘除，
-    /// 所以必须把 mock handle 一路持有到测试结束。
-    struct MockEnv {
-        _sd_server: mockito::ServerGuard,
-        _bgm_server: mockito::ServerGuard,
-        _mocks: Vec<mockito::Mock>,
-        db: Arc<Database>,
-        svc: SyncService,
+    #[test]
+    fn test_to_create_subject_maps_air_date_platform_summary_tags_nsfw() {
+        use crate::services::bangumi::schemas::Tag;
+        let s = BangumiSubject {
+            id: 515759,
+            _type: 2,
+            name: Some("葬送のフリーレン 第2期".to_string()),
+            name_cn: Some("葬送的芙莉莲 第二季".to_string()),
+            summary: Some("勇者死后...".to_string()),
+            series: None,
+            nsfw: Some(false),
+            locked: None,
+            date: Some("2026-01-16".to_string()),
+            platform: Some("TV".to_string()),
+            images: None,
+            infobox: None,
+            volumes: None,
+            eps: None,
+            total_episodes: None,
+            rating: None,
+            collection: None,
+            meta_tags: None,
+            tags: Some(vec![
+                Tag {
+                    name: Some("奇幻".to_string()),
+                    count: Some(120),
+                },
+                Tag {
+                    name: None,
+                    count: Some(5),
+                },
+                Tag {
+                    name: Some("冒险".to_string()),
+                    count: Some(80),
+                },
+            ]),
+        };
+        let create = to_create_subject(s, None);
+        assert_eq!(create.air_date.as_deref(), Some("2026-01-16"));
+        assert_eq!(create.platform.as_deref(), Some("TV"));
+        assert_eq!(create.summary.as_deref(), Some("勇者死后..."));
+        assert_eq!(create.nsfw, Some(false));
+        assert_eq!(create.tags.as_deref(), Some(r#"["奇幻","冒险"]"#));
     }
 
-    /// `season_json` 是 season-data.json 的完整响应体；
-    /// Bangumi 侧对任何 subject 都返回同一份详情。
-    async fn mock_env(pool: SqlitePool, season_json: &str) -> MockEnv {
+    // ── create_and_sync / resync hydrate 行为测试 ─────────────────────────────
+
+    async fn seed_mal_match_for_sync(
+        pool: &SqlitePool,
+        season_id: i32,
+        mal_id: i32,
+        bgm_id: Option<i32>,
+        status: &str,
+        is_removed: bool,
+    ) -> sqlx::Result<()> {
+        use crate::dal::dto::{UpdateMalBgmMatch, UpsertMalAnime};
+        use crate::dal::repositories::{
+            MalAnimeRepository, MalBgmMatchRepository, SeasonMalRepository,
+        };
+
+        if let Some(id) = bgm_id
+            && SubjectRepository::new(pool).find_by_id(id).await?.is_none()
+        {
+            SubjectRepository::new(pool)
+                .create(CreateSubject {
+                    id,
+                    ..Default::default()
+                })
+                .await?;
+        }
+
+        MalAnimeRepository::new(pool)
+            .upsert(UpsertMalAnime {
+                mal_id,
+                title: format!("MAL {}", mal_id),
+                media_type: "tv".to_string(),
+                ..Default::default()
+            })
+            .await?;
+
+        let sm_repo = SeasonMalRepository::new(pool);
+        sm_repo.insert_ignore(season_id, mal_id).await?;
+        if is_removed {
+            sm_repo.set_removed(season_id, mal_id, true, None).await?;
+        }
+
+        MalBgmMatchRepository::new(pool)
+            .upsert(
+                mal_id,
+                UpdateMalBgmMatch {
+                    status: status.to_string(),
+                    source: Some("human".to_string()),
+                    bgm_id,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_resync_hydrates_only_distinct_included_non_removed_subjects(
+        pool: SqlitePool,
+    ) -> sqlx::Result<()> {
         let mut bgm_server = mockito::Server::new_async().await;
-        let mut sd_server = mockito::Server::new_async().await;
 
-        let mocks = vec![
-            bgm_server
-                .mock("GET", mockito::Matcher::Regex(r"^/v0/episodes".into()))
-                .with_header("content-type", "application/json")
-                .with_body(r#"{"total":0,"limit":100,"offset":0,"data":[]}"#)
-                .create_async()
-                .await,
-            bgm_server
-                .mock("GET", mockito::Matcher::Regex(r"^/v0/subjects/\d+".into()))
-                .with_header("content-type", "application/json")
-                .with_body(
-                    r#"{"id":444957,"type":2,"name":"燃比娃","name_cn":"燃比娃","images":null,
-                        "rating":{"rank":100,"total":10,"count":{"8":10},"score":8.0},
-                        "collection":{"wish":1,"collect":2,"doing":3,"on_hold":4,"dropped":5},
-                        "infobox":[],"meta_tags":[],"tags":[]}"#,
-                )
-                .create_async()
-                .await,
-            sd_server
-                .mock("GET", "/season-data.json")
-                .with_header("content-type", "application/json")
-                .with_body(season_json)
-                .create_async()
-                .await,
-        ];
+        let ep_mock = bgm_server
+            .mock("GET", mockito::Matcher::Regex(r"^/v0/episodes".into()))
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"total":0,"limit":100,"offset":0,"data":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
 
-        let db = Arc::new(Database::from_pool(pool));
+        let subj_mock = bgm_server
+            .mock("GET", "/v0/subjects/444957")
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":444957,"type":2,"name":"燃比娃","name_cn":"燃比娃",
+                    "date":"2026-04-01","platform":"剧场版","summary":"测试简介","nsfw":false,
+                    "images":null,
+                    "rating":{"rank":100,"total":10,"count":{"8":10},"score":8.0},
+                    "collection":{"wish":1,"collect":2,"doing":3,"on_hold":4,"dropped":5},
+                    "infobox":[],"meta_tags":["剧场版"],"tags":[{"name":"奇幻","count":10}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let db = Arc::new(Database::from_pool(pool.clone()));
         let svc = SyncService::with_clients(
             Arc::clone(&db),
-            SeasonDataClient::with_url(sd_server.url() + "/season-data.json"),
             BangumiClient::with_base_url(&bgm_server.url()),
         );
 
-        MockEnv {
-            _sd_server: sd_server,
-            _bgm_server: bgm_server,
-            _mocks: mocks,
-            db,
-            svc,
-        }
-    }
+        SeasonRepository::new(&pool)
+            .upsert(CreateSeason {
+                season_id: 202604,
+                year: 2026,
+                season: "SPRING".to_string(),
+                name: None,
+            })
+            .await?;
+        SeasonRepository::new(&pool)
+            .upsert(CreateSeason {
+                season_id: 202601,
+                year: 2026,
+                season: "WINTER".to_string(),
+                name: None,
+            })
+            .await?;
 
-    #[sqlx::test]
-    async fn test_reconcile_all_adds_missing_subject_and_is_idempotent(pool: SqlitePool) {
-        let env = mock_env(
-            pool,
-            r#"{"2026-spring": [{"bgm_id": 444957, "media_type": "movie", "rating": "general"}]}"#,
-        )
-        .await;
-        let (db, svc) = (&env.db, &env.svc);
+        // 两个 mal_id 指向同一个 bgm_id=444957 (included + non-removed): 应去重只拉一次
+        seed_mal_match_for_sync(&pool, 202604, 1001, Some(444957), "included", false).await?;
+        seed_mal_match_for_sync(&pool, 202604, 1002, Some(444957), "included", false).await?;
+        // is_removed = 1: 不应被 hydrate
+        seed_mal_match_for_sync(&pool, 202604, 1003, Some(444958), "included", true).await?;
+        // pending / excluded: 不应被 hydrate
+        seed_mal_match_for_sync(&pool, 202604, 1004, Some(444959), "pending", false).await?;
+        seed_mal_match_for_sync(&pool, 202604, 1005, Some(444960), "excluded", false).await?;
+        // 其他季度: 不应被 hydrate
+        seed_mal_match_for_sync(&pool, 202601, 1006, Some(444961), "included", false).await?;
 
-        // 第一次：季度和条目都不存在，应新建并 hydrate
-        let r = svc.reconcile_all().await.unwrap();
-        assert_eq!(r.total_added, 1);
-        assert_eq!(r.total_removed, 0);
-        assert_eq!(r.hydrate_failed, 0);
-        assert_eq!(r.changes.len(), 1);
-        assert_eq!(r.changes[0].season_id, 202604);
-        assert_eq!(r.changes[0].added, vec![444957]);
+        let (tx, mut rx) = mpsc::channel(16);
+        let result = svc.resync(202604, Some(tx)).await.unwrap();
+        assert_eq!(result.season_id, 202604);
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.failed, 0);
 
-        // 注意事项 2：库里没有的季度应被 upsert 出来
-        let season = SeasonRepository::new(db.pool())
-            .find_by_id(202604)
-            .await
-            .unwrap()
-            .expect("2026-spring 应被自动创建");
-        assert_eq!(season.season, "SPRING");
+        ep_mock.assert_async().await;
+        subj_mock.assert_async().await;
 
-        // 新增条目应补到详情，不是空壳
-        let subject = SubjectRepository::new(db.pool())
+        let subject = SubjectRepository::new(&pool)
             .find_by_id(444957)
-            .await
-            .unwrap()
-            .expect("subject 应存在");
-        assert_eq!(subject.name_cn, Some("燃比娃".to_string()));
-        assert_eq!(subject.media_type, Some("movie".to_string()));
+            .await?
+            .expect("subject 444957 should exist");
+        assert_eq!(subject.name_cn.as_deref(), Some("燃比娃"));
+        assert_eq!(subject.air_date.as_deref(), Some("2026-04-01"));
+        assert_eq!(subject.platform.as_deref(), Some("剧场版"));
+        assert_eq!(subject.summary.as_deref(), Some("测试简介"));
+        assert_eq!(subject.tags.as_deref(), Some(r#"["奇幻"]"#));
+        assert_eq!(subject.nsfw, Some(false));
+        assert!(subject.last_updated_at.is_some());
 
-        // 第二次：应完全幂等
-        let r2 = svc.reconcile_all().await.unwrap();
-        assert_eq!(r2.total_added, 0);
-        assert_eq!(r2.total_removed, 0);
-        assert!(r2.changes.is_empty());
+        // 未被 hydrate 的条目保持骨架状态
+        assert!(
+            SubjectRepository::new(&pool)
+                .find_by_id(444958)
+                .await?
+                .unwrap()
+                .last_updated_at
+                .is_none()
+        );
+
+        let mut saw_progress = false;
+        let mut saw_done = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                SyncProgressEvent::Progress {
+                    total,
+                    done,
+                    subject_id,
+                } => {
+                    assert_eq!(total, 1);
+                    assert_eq!(done, 1);
+                    assert_eq!(subject_id, 444957);
+                    saw_progress = true;
+                }
+                SyncProgressEvent::Done {
+                    season_id,
+                    updated,
+                    failed,
+                    ..
+                } => {
+                    assert_eq!(season_id, 202604);
+                    assert_eq!(updated, 1);
+                    assert_eq!(failed, 0);
+                    saw_done = true;
+                }
+                SyncProgressEvent::Error { .. } => panic!("unexpected error event"),
+            }
+        }
+        assert!(saw_progress && saw_done);
+
+        Ok(())
     }
 
     #[sqlx::test]
-    async fn test_reconcile_all_skips_empty_season_instead_of_wiping(pool: SqlitePool) {
-        // 注意事项 3：上游会把没有 included 条目的季度铺成空数组
-        let env = mock_env(pool, r#"{"2026-spring": []}"#).await;
-        let svc = &env.svc;
-        let pool = env.db.pool();
+    async fn test_create_and_sync_creates_season_and_hydrates_included_subjects(
+        pool: SqlitePool,
+    ) -> sqlx::Result<()> {
+        let mut bgm_server = mockito::Server::new_async().await;
+        let _ep_mock = bgm_server
+            .mock("GET", mockito::Matcher::Regex(r"^/v0/episodes".into()))
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"total":0,"limit":100,"offset":0,"data":[]}"#)
+            .create_async()
+            .await;
+        let _subj_mock = bgm_server
+            .mock("GET", "/v0/subjects/515759")
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":515759,"type":2,"name":"葬送のフリーレン","name_cn":"葬送的芙莉莲",
+                    "date":"2026-01-16","platform":"TV","summary":"简介","nsfw":false,
+                    "rating":{"rank":10,"total":10,"count":{"9":10}},"collection":{"wish":1,"collect":2,"doing":3,"on_hold":4,"dropped":5},
+                    "infobox":[],"meta_tags":["TV"],"tags":[{"name":"奇幻","count":100}]}"#,
+            )
+            .create_async()
+            .await;
 
-        // 预置一个已有成员的季度
-        SeasonRepository::new(pool)
+        let db = Arc::new(Database::from_pool(pool.clone()));
+        let svc = SyncService::with_clients(
+            Arc::clone(&db),
+            BangumiClient::with_base_url(&bgm_server.url()),
+        );
+
+        let r = svc
+            .create_and_sync(2026, 1, Some("2026冬".to_string()), None)
+            .await
+            .unwrap();
+        assert_eq!(r.season_id, 202601);
+        assert_eq!(r.updated, 0);
+
+        seed_mal_match_for_sync(&pool, 202601, 59978, Some(515759), "included", false).await?;
+
+        let r2 = svc.create_and_sync(2026, 1, None, None).await.unwrap();
+        assert_eq!(r2.updated, 1);
+        assert_eq!(r2.failed, 0);
+
+        let season = SeasonRepository::new(&pool)
+            .find_by_id(202601)
+            .await?
+            .unwrap();
+        assert_eq!(season.name.as_deref(), Some("2026冬"));
+
+        let subject = SubjectRepository::new(&pool)
+            .find_by_id(515759)
+            .await?
+            .unwrap();
+        assert_eq!(subject.name_cn.as_deref(), Some("葬送的芙莉莲"));
+        assert_eq!(subject.air_date.as_deref(), Some("2026-01-16"));
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_sync_service_hydrate_delay_default_and_configurable(
+        pool: SqlitePool,
+    ) -> sqlx::Result<()> {
+        let db = Arc::new(Database::from_pool(pool.clone()));
+        let default_svc = SyncService::new(Arc::clone(&db));
+        assert_eq!(default_svc.hydrate_delay(), Duration::from_millis(500));
+
+        let mut bgm_server = mockito::Server::new_async().await;
+        let ep_mock = bgm_server
+            .mock("GET", mockito::Matcher::Regex(r"^/v0/episodes".into()))
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"total":0,"limit":100,"offset":0,"data":[]}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let subj_mock = bgm_server
+            .mock("GET", mockito::Matcher::Regex(r"^/v0/subjects/\d+$".into()))
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":101,"type":2,"name":"Test"}"#)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let delayed_svc = SyncService::with_clients(
+            Arc::clone(&db),
+            BangumiClient::with_base_url(&bgm_server.url()),
+        )
+        .with_hydrate_delay(Duration::from_millis(30));
+        assert_eq!(delayed_svc.hydrate_delay(), Duration::from_millis(30));
+
+        SeasonRepository::new(&pool)
             .upsert(CreateSeason {
                 season_id: 202604,
                 year: 2026,
                 season: "SPRING".to_string(),
-                name: None,
+                name: Some("2026春".to_string()),
             })
-            .await
-            .unwrap();
-        SubjectRepository::new(pool)
-            .upsert_meta_batch(&[(444957, Some("movie".into()), Some("general".into()))])
-            .await
-            .unwrap();
-        SeasonSubjectRepository::new(pool)
-            .insert_or_ignore(crate::dal::CreateSeasonSubject {
-                season_id: 202604,
-                subject_id: 444957,
-            })
-            .await
-            .unwrap();
+            .await?;
+        seed_mal_match_for_sync(&pool, 202604, 1001, Some(101), "included", false).await?;
+        seed_mal_match_for_sync(&pool, 202604, 1002, Some(102), "included", false).await?;
 
-        let r = svc.reconcile_all().await.unwrap();
-        assert_eq!(r.seasons_skipped, 1);
-        assert_eq!(r.total_removed, 0, "空季度绝不能触发删除");
+        let started = std::time::Instant::now();
+        let res = delayed_svc.resync(202604, None).await.unwrap();
+        let elapsed = started.elapsed();
 
-        let members = SeasonSubjectRepository::new(pool)
-            .find_by_season_id(202604)
-            .await
+        assert_eq!(res.updated, 2);
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "expected delay between 2 hydrate calls, elapsed={:?}",
+            elapsed
+        );
+        ep_mock.assert_async().await;
+        subj_mock.assert_async().await;
+
+        // Resync must preserve existing season name (no redundant early upsert)
+        let season = SeasonRepository::new(&pool)
+            .find_by_id(202604)
+            .await?
             .unwrap();
-        assert_eq!(members, vec![444957], "成员必须原样保留");
-    }
+        assert_eq!(season.name.as_deref(), Some("2026春"));
 
-    #[sqlx::test]
-    async fn test_reconcile_all_removes_stale_member(pool: SqlitePool) {
-        let env = mock_env(
-            pool,
-            r#"{"2026-spring": [{"bgm_id": 444957, "media_type": "movie", "rating": "general"}]}"#,
-        )
-        .await;
-        let svc = &env.svc;
-        let pool = env.db.pool();
-
-        SeasonRepository::new(pool)
-            .upsert(CreateSeason {
-                season_id: 202604,
-                year: 2026,
-                season: "SPRING".to_string(),
-                name: None,
-            })
-            .await
-            .unwrap();
-        SubjectRepository::new(pool)
-            .upsert_meta_batch(&[(111111, None, None)])
-            .await
-            .unwrap();
-        SeasonSubjectRepository::new(pool)
-            .insert_or_ignore(crate::dal::CreateSeasonSubject {
-                season_id: 202604,
-                subject_id: 111111,
-            })
-            .await
-            .unwrap();
-
-        let r = svc.reconcile_all().await.unwrap();
-        assert_eq!(r.total_added, 1);
-        assert_eq!(r.total_removed, 1);
-        assert_eq!(r.changes[0].removed, vec![111111]);
-
-        let members = SeasonSubjectRepository::new(pool)
-            .find_by_season_id(202604)
-            .await
-            .unwrap();
-        assert_eq!(members, vec![444957]);
-    }
-
-    #[sqlx::test]
-    async fn test_reconcile_all_skips_unparsable_key(pool: SqlitePool) {
-        let env = mock_env(
-            pool,
-            r#"{"2026-autumn": [{"bgm_id": 444957, "media_type": "tv", "rating": "general"}]}"#,
-        )
-        .await;
-
-        let r = env.svc.reconcile_all().await.unwrap();
-        assert_eq!(r.seasons_skipped, 1);
-        assert_eq!(r.total_added, 0);
+        Ok(())
     }
 }
