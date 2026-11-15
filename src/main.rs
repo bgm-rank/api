@@ -238,7 +238,8 @@ struct MatchCliArgs {
 }
 
 fn parse_match_args(args: &[String]) -> Result<MatchCliArgs, String> {
-    const USAGE: &str = "usage: bgm-rank-api match --season <202601> [--retry] | --mal-id <id>";
+    const USAGE: &str =
+        "usage: bgm-rank-api match --season <202601> [--retry] | --mal-id <id> [--retry]";
     let (mut season, mut mal_id) = (None, None);
     let mut retry = false;
     let mut i = 0;
@@ -548,6 +549,13 @@ mod tests {
             MatchCliArgs {
                 target: MatchTarget::MalId(42),
                 retry: false
+            }
+        );
+        assert_eq!(
+            parse_match_args(&v(&["--mal-id", "42", "--retry"])).unwrap(),
+            MatchCliArgs {
+                target: MatchTarget::MalId(42),
+                retry: true
             }
         );
         assert!(parse_match_args(&v(&[])).is_err());

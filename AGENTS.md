@@ -27,7 +27,7 @@ api
 ├── .env.example                # 环境变量模板
 ├── migrations/                 # SQLx 自动迁移脚本
 └── src/
-    ├── main.rs                 # 程序入口：CLI 子命令分发 (import-season-data)、环境初始化、DB 连接、调度器后台任务、HTTP Server 启动
+    ├── main.rs                 # 程序入口：CLI 子命令分发 (fetch-mal / match / import-season-data)、环境初始化、DB 连接、调度器后台任务、HTTP Server 启动
     ├── api/                    # 接口层 (HTTP Routing, Handlers, Middleware, Schemas)
     │   ├── mod.rs              # Router 组装与中间件层 (RequestId, TraceLayer)
     │   ├── endpoints.rs        # Public 与 Admin 路由 Handler 实现及 AppState 定义
@@ -37,6 +37,7 @@ api
     │       └── auth.rs         # 管理员 Bearer Token 鉴权中间件 (`require_admin_token`)
     ├── core/                   # 核心业务逻辑层 (Domain Services)
     │   ├── mod.rs
+    │   ├── fetch/mod.rs        # MalFetchService：MAL 季度新番抓取与入库（仅收录当季开播新番）
     │   ├── matcher/mod.rs      # MatcherService：MAL→BGM 四层匹配管线（规则/搜索/精确/LLM）
     │   ├── import/mod.rs       # ImportService (`import_season_data`)：从旧 season.db 一次性迁移数据
     │   ├── query/mod.rs        # QueryService：公开接口的数据查询与聚合组装
@@ -63,6 +64,7 @@ api
     └── services/               # 外部服务客户端层
         ├── mod.rs
         ├── bangumi/            # Bangumi v0 API 客户端 (`GET /v0/subjects/{id}`, `GET /v0/episodes`, `POST /v0/search/subjects`)
+        ├── mal/                # MAL v2 API 客户端 (`MalClient`：`GET /v2/anime/season/{year}/{season}`)
         ├── llm/                # OpenAI 兼容 LLM 客户端 (`LlmClient`，trait `LlmMatcher`：`match_anime` / `suggest_search`)
         └── deploy_hook/        # 外部部署 Webhook 触发客户端 (`DeployHookClient`)
 ```
@@ -85,7 +87,8 @@ api
      - `air_weekday`: 从 Infobox 中提取放送星期
      - 支持通过 `mpsc::Sender<SyncProgressEvent>` 推送实时同步进度。
    - **`SchedulerService`**: 在 UTC+8 的 `0, 4, 8, 12, 16, 20` 整点唤醒（或通过 `SchedulerHandle` 手动唤醒）。每次 Tick 根据季度距离（`age`）按不同时间间隔刷新到期番剧，最后触发 Deploy Hook（手动触发除外）。使用 `AtomicBool` 防止重入并发。
-   - **`MatcherService`** (`core/matcher`): `match_mal(mal_id, retry)` / `match_season(season_id, retry)`，按 `docs/drop-season-data-analysis.md` §2 的四层管线写 `mal_bgm_matches`（已 included/excluded 短路；韩文标题只允许精确匹配且不调用 LLM；LLM `confidence >= 0.85` 且无 `match_conflicts` 才自动 included 并 `hydrate_subject`）。LLM 通过 `LlmMatcher` trait 注入，测试使用 fake。
+   - **`MalFetchService`** (`core/fetch`): `fetch_season(season_id)` / `fetch_range(from, to)`，拉取 MAL 季度列表并按 `is_new_anime` 过滤非当季开播的续播/长篇番剧，幂等写入 `mal_anime`、`season_mal`（`ON CONFLICT DO NOTHING`）与 `mal_bgm_matches` 初始 `pending` 行。
+   - **`MatcherService`** (`core/matcher`): `match_mal(mal_id, retry)` / `match_season(season_id, retry)`，按 `docs/drop-season-data-analysis.md` §2 的四层管线写 `mal_bgm_matches`（已 included/excluded 短路；韩文标题只允许精确匹配且不调用 LLM；精确匹配与 LLM `confidence >= 0.85` 均需通过本地 `enrich` 后的 `match_conflicts` 硬规则校验才自动 included 并按需触发 `hydrate_subject`）。LLM 通过 `LlmMatcher` trait 注入，测试使用 fake。
    - **`AdminService`**: 封装管理员对季度、番剧、匹配审核、`season_mal` 跨季移动的修改/删除，JSONL 导出（`export_season_mal_jsonl`、`export_matches_jsonl`），以及对调度器和 Deploy Hook 的控制。
    - **`import` 模块 (`import_season_data`)**: 供 `main.rs` 的一次性 `import-season-data` CLI 子命令调用，在单事务中从旧 `season.db`（及可选原始 MAL JSON 目录）幂等迁移 `seasons`、`subjects` 骨架、`mal_anime`、`season_mal` 与 `mal_bgm_matches`。
 3. **DAL 数据访问层 (`src/dal/`)**
