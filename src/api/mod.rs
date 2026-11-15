@@ -9,8 +9,13 @@ pub use schemas::*;
 
 use std::sync::Arc;
 
-use axum::{Router, routing::get};
+use axum::{
+    Router,
+    http::{HeaderName, Method, header},
+    routing::get,
+};
 use tower_http::{
+    cors::{Any, CorsLayer},
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     trace::TraceLayer,
 };
@@ -25,6 +30,22 @@ use endpoints::{
 /// 构建带有完整中间件栈的应用 Router（从已有 AppState 构建）
 pub fn create_app_from_state(state: AppState) -> Router {
     let admin = admin_router(state.clone());
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            HeaderName::from_static("x-request-id"),
+        ])
+        .expose_headers([HeaderName::from_static("x-request-id")]);
 
     Router::new()
         .route("/health", get(health_check))
@@ -37,6 +58,7 @@ pub fn create_app_from_state(state: AppState) -> Router {
         )
         .with_state(state)
         .merge(admin)
+        .layer(cors)
         // T009: 生成 UUID request_id 并写入 x-request-id header，复制到响应
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(
@@ -108,6 +130,35 @@ mod tests {
         assert!(
             resp.headers().contains_key("x-request-id"),
             "响应中应包含 x-request-id header"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_cors_preflight_on_admin_route_succeeds_without_auth(pool: SqlitePool) {
+        let db = Arc::new(Database::from_pool(pool));
+        let app = super::create_app(db);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/admin/matches")
+                    .header("Origin", "http://localhost:5173")
+                    .header("Access-Control-Request-Method", "PATCH")
+                    .header(
+                        "Access-Control-Request-Headers",
+                        "authorization,content-type",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert!(
+            resp.headers().contains_key("access-control-allow-origin"),
+            "CORS preflight response must include access-control-allow-origin"
         );
     }
 }

@@ -18,15 +18,20 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::core::AdminService;
 use crate::core::SyncService;
 use crate::core::admin::{AdminOpError, PatchMatchInput};
+use crate::core::fetch::parse_season_id;
+use crate::core::matcher::{MatchProgressEvent, MatcherService};
 use crate::core::query::QueryService;
 use crate::core::scheduler::SchedulerHandle;
 use crate::core::sync::SyncProgressEvent;
 use crate::dal::Database;
+use crate::services::llm::{LlmClient, LlmMatcher};
+use crate::services::mal::MalClient;
 
 use super::middleware::require_admin_token;
 use super::schemas::{
-    AcceptedResponse, CreateSeasonRequest, DeleteOrphansResponse, DeleteSeasonResponse,
-    DeletedResponse, EditSeasonRequest, EditSubjectRequest, ErrorResponse, ListMatchesQuery,
+    AcceptedResponse, AddSeasonMalRequest, BatchRerunRequest, BgmSearchQuery, CreateSeasonRequest,
+    DeleteOrphansResponse, DeleteSeasonResponse, DeletedResponse, EditSeasonRequest,
+    EditSubjectRequest, ErrorResponse, FetchSeasonMalResponse, ListMatchesQuery, MatchSeasonQuery,
     MoveSeasonMalRequest, MoveSeasonMalResponse, OrphanSubjectItem, PatchMatchRequest,
     PatchMatchResponse, RemovedResponse, RestoredResponse, SchedulerStatusResponse,
 };
@@ -54,6 +59,7 @@ pub struct AppState {
     pub sync_service: Arc<SyncService>,
     pub query_service: Arc<QueryService>,
     pub admin_service: Arc<AdminService>,
+    pub matcher_service: Arc<MatcherService>,
     pub scheduler_handle: Arc<SchedulerHandle>,
 }
 
@@ -62,6 +68,15 @@ impl AppState {
         let handle = SchedulerHandle::new();
         let deploy_hook_url = std::env::var("DEPLOY_HOOK_URL").ok();
         let sync_service = Arc::new(SyncService::new(Arc::clone(&db)));
+        let llm: Option<Arc<dyn LlmMatcher>> = LlmClient::from_env()
+            .ok()
+            .flatten()
+            .map(|c| Arc::new(c) as Arc<dyn LlmMatcher>);
+        let matcher_service = Arc::new(MatcherService::new(
+            Arc::clone(&db),
+            Arc::clone(&sync_service),
+            llm,
+        ));
         let admin_service = AdminService::with_sync_service(
             Arc::clone(&db),
             handle.clone(),
@@ -72,6 +87,7 @@ impl AppState {
             query_service: Arc::new(QueryService::new(Arc::clone(&db))),
             sync_service,
             admin_service: Arc::new(admin_service),
+            matcher_service,
             scheduler_handle: Arc::new(handle),
             db,
         }
@@ -663,6 +679,200 @@ pub async fn export_matches(State(state): State<AppState>) -> impl IntoResponse 
     ndjson_response(state.admin_service.export_matches_jsonl().await)
 }
 
+fn match_progress_to_sse_stream(
+    rx: mpsc::Receiver<MatchProgressEvent>,
+) -> impl tokio_stream::Stream<Item = Result<Event, Infallible>> {
+    ReceiverStream::new(rx).map(|event| {
+        let data = match event {
+            MatchProgressEvent::Progress {
+                total,
+                done,
+                mal_id,
+                outcome,
+            } => {
+                serde_json::json!({
+                    "type": "progress",
+                    "total": total,
+                    "done": done,
+                    "mal_id": mal_id,
+                    "outcome": outcome
+                })
+            }
+            MatchProgressEvent::Done {
+                season_id,
+                total,
+                skipped,
+                included,
+                excluded,
+                pending,
+                failed,
+            } => {
+                serde_json::json!({
+                    "type": "done",
+                    "season_id": season_id,
+                    "total": total,
+                    "skipped": skipped,
+                    "included": included,
+                    "excluded": excluded,
+                    "pending": pending,
+                    "failed": failed
+                })
+            }
+            MatchProgressEvent::Error { message } => {
+                serde_json::json!({ "type": "error", "message": message })
+            }
+        };
+        Ok::<Event, Infallible>(Event::default().data(data.to_string()))
+    })
+}
+
+// GET /admin/bgm/search?q=
+pub async fn search_bgm(
+    State(state): State<AppState>,
+    Query(query): Query<BgmSearchQuery>,
+) -> impl IntoResponse {
+    match state.admin_service.search_bgm_subjects(&query.q).await {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => admin_op_error_response(e),
+    }
+}
+
+// GET /admin/bgm/subjects/{bgm_id}
+pub async fn preview_bgm_subject(
+    State(state): State<AppState>,
+    Path(bgm_id): Path<i32>,
+) -> impl IntoResponse {
+    match state.admin_service.preview_bgm_subject(bgm_id).await {
+        Ok(item) => Json(item).into_response(),
+        Err(e) => admin_op_error_response(e),
+    }
+}
+
+// POST /admin/subjects/{subject_id}/sync
+pub async fn sync_subject(
+    State(state): State<AppState>,
+    Path(subject_id): Path<i32>,
+) -> impl IntoResponse {
+    match state.admin_service.refresh_subject(subject_id).await {
+        Ok(s) => Json(s).into_response(),
+        Err(e) => admin_op_error_response(e),
+    }
+}
+
+// POST /admin/seasons/{season_id}/fetch-mal
+pub async fn fetch_season_mal(
+    State(state): State<AppState>,
+    Path(season_id): Path<i32>,
+) -> impl IntoResponse {
+    let mal_client = MalClient::from_env().ok();
+    match state
+        .admin_service
+        .fetch_season_mal(season_id, mal_client)
+        .await
+    {
+        Ok(summary) => Json(FetchSeasonMalResponse {
+            season_id,
+            fetched: summary.fetched,
+            new: summary.new,
+        })
+        .into_response(),
+        Err(e) => admin_op_error_response(e),
+    }
+}
+
+// POST /admin/seasons/{season_id}/mal
+pub async fn add_season_mal(
+    State(state): State<AppState>,
+    Path(season_id): Path<i32>,
+    Json(req): Json<AddSeasonMalRequest>,
+) -> impl IntoResponse {
+    let mal_client = MalClient::from_env().ok();
+    match state
+        .admin_service
+        .add_manual_mal_to_season(season_id, req.mal_id, req.note, mal_client.as_ref())
+        .await
+    {
+        Ok(res) => Json(res).into_response(),
+        Err(e) => admin_op_error_response(e),
+    }
+}
+
+// POST /admin/seasons/{season_id}/match?retry=false
+pub async fn match_season_sse(
+    State(state): State<AppState>,
+    Path(season_id): Path<i32>,
+    Query(query): Query<MatchSeasonQuery>,
+) -> Response {
+    if let Err(e) = parse_season_id(season_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let (tx, rx) = mpsc::channel::<MatchProgressEvent>(64);
+    let svc = Arc::clone(&state.matcher_service);
+    let retry = query.retry;
+
+    tokio::spawn(async move {
+        if let Err(e) = svc
+            .match_season_with_progress(season_id, retry, Some(tx.clone()))
+            .await
+        {
+            let _ = tx
+                .send(MatchProgressEvent::Error {
+                    message: e.to_string(),
+                })
+                .await;
+        }
+    });
+
+    Sse::new(match_progress_to_sse_stream(rx))
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+// POST /admin/matches/rerun
+pub async fn rerun_matches_sse(
+    State(state): State<AppState>,
+    Json(req): Json<BatchRerunRequest>,
+) -> Response {
+    if req.mal_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "mal_ids cannot be empty".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let (tx, rx) = mpsc::channel::<MatchProgressEvent>(64);
+    let svc = Arc::clone(&state.matcher_service);
+    let mal_ids = req.mal_ids;
+    let reset = req.reset_to_pending;
+
+    tokio::spawn(async move {
+        if let Err(e) = svc
+            .rerun_mal_ids_with_progress(&mal_ids, reset, Some(tx.clone()))
+            .await
+        {
+            let _ = tx
+                .send(MatchProgressEvent::Error {
+                    message: e.to_string(),
+                })
+                .await;
+        }
+    });
+
+    Sse::new(match_progress_to_sse_stream(rx))
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
 pub fn admin_router(state: AppState) -> axum::Router {
     use axum::routing::{delete, get, patch, post};
     axum::Router::new()
@@ -673,6 +883,12 @@ pub fn admin_router(state: AppState) -> axum::Router {
         .route("/admin/seasons/{season_id}", delete(delete_season))
         .route("/admin/seasons/{season_id}", patch(patch_season))
         .route("/admin/seasons/{season_id}/sync", post(sync_season))
+        .route(
+            "/admin/seasons/{season_id}/fetch-mal",
+            post(fetch_season_mal),
+        )
+        .route("/admin/seasons/{season_id}/match", post(match_season_sse))
+        .route("/admin/seasons/{season_id}/mal", post(add_season_mal))
         .route(
             "/admin/seasons/{season_id}/mal/{mal_id}",
             delete(remove_season_mal),
@@ -686,7 +902,10 @@ pub fn admin_router(state: AppState) -> axum::Router {
             post(restore_season_mal),
         )
         .route("/admin/matches", get(list_matches))
+        .route("/admin/matches/rerun", post(rerun_matches_sse))
         .route("/admin/matches/{mal_id}", patch(patch_match))
+        .route("/admin/bgm/search", get(search_bgm))
+        .route("/admin/bgm/subjects/{bgm_id}", get(preview_bgm_subject))
         .route("/admin/export/season_mal", get(export_season_mal))
         .route("/admin/export/matches", get(export_matches))
         .route("/admin/scheduler/trigger", post(trigger_scheduler))
@@ -696,6 +915,7 @@ pub fn admin_router(state: AppState) -> axum::Router {
         .route("/admin/subjects/{subject_id}", get(admin_get_subject))
         .route("/admin/subjects/{subject_id}", patch(patch_subject))
         .route("/admin/subjects/{subject_id}", delete(delete_subject))
+        .route("/admin/subjects/{subject_id}/sync", post(sync_subject))
         .layer(middleware::from_fn(require_admin_token))
         .with_state(state)
 }
@@ -735,6 +955,12 @@ mod tests {
             Arc::clone(&db),
             BangumiClient::with_base_url(bgm_url),
         ));
+        let matcher_service = Arc::new(MatcherService::with_clients(
+            Arc::clone(&db),
+            BangumiClient::with_base_url(bgm_url),
+            Arc::clone(&sync_service),
+            None,
+        ));
         let admin_service = AdminService::with_sync_service(
             Arc::clone(&db),
             handle.clone(),
@@ -745,6 +971,7 @@ mod tests {
             query_service: Arc::new(QueryService::new(Arc::clone(&db))),
             sync_service,
             admin_service: Arc::new(admin_service),
+            matcher_service,
             scheduler_handle: Arc::new(handle),
             db,
         }
@@ -1707,7 +1934,13 @@ mod tests {
                 "name": "葬送のフリーレン 第2期",
                 "name_cn": "葬送的芙莉莲 第二季",
                 "rank": 7,
-                "score": 8.85
+                "score": 8.85,
+                "air_date": null,
+                "platform": null,
+                "nsfw": null,
+                "tags": null,
+                "summary": null,
+                "images_grid": null
             })
         );
 
@@ -2428,5 +2661,191 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[sqlx::test]
+    async fn test_admin_bgm_search_and_preview_include_linked_matches(pool: SqlitePool) {
+        let mut bgm = mockito::Server::new_async().await;
+        let search_mock = bgm
+            .mock("POST", "/v0/search/subjects?limit=10")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "total": 1,
+                    "limit": 10,
+                    "offset": 0,
+                    "data": [{
+                        "id": 515759,
+                        "type": 2,
+                        "name": "葬送のフリーレン 第2期",
+                        "name_cn": "葬送的芙莉莲 第二季",
+                        "date": "2026-01-10",
+                        "platform": "TV",
+                        "eps": 24,
+                        "rating": { "rank": 2, "score": 8.9 },
+                        "tags": [{ "name": "奇幻" }, { "name": "冒险" }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let subj_mock = bgm
+            .mock("GET", "/v0/subjects/515759")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "id": 515759,
+                    "type": 2,
+                    "name": "葬送のフリーレン 第2期",
+                    "name_cn": "葬送的芙莉莲 第二季",
+                    "date": "2026-01-10",
+                    "platform": "TV",
+                    "eps": 24,
+                    "rating": { "rank": 2, "score": 8.9 }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        seed_season_mal_and_match(&pool, 202510, 54321, "included", Some(515759)).await;
+
+        let db = test_db(pool);
+        let app = admin_router(state_with_bgm_url(db, &bgm.url()));
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/bgm/search?q=Frieren")
+                    .header("Authorization", admin_token())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body[0]["id"], 515759);
+        assert_eq!(body[0]["linked_matches"][0]["mal_id"], 54321);
+        assert_eq!(body[0]["linked_matches"][0]["seasons"][0], 202510);
+        search_mock.assert_async().await;
+
+        let preview_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/bgm/subjects/515759")
+                    .header("Authorization", admin_token())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview_resp.status(), StatusCode::OK);
+        let pbody: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(preview_resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pbody["id"], 515759);
+        assert_eq!(pbody["eps"], 24);
+        assert_eq!(pbody["linked_matches"][0]["mal_id"], 54321);
+        subj_mock.assert_async().await;
+    }
+
+    #[sqlx::test]
+    async fn test_admin_manual_add_mal_and_match_sse_and_rerun(pool: SqlitePool) {
+        let bgm = mockito::Server::new_async().await;
+        // mal_id 701 is media_type = "pv", so MatcherService excludes it by rule without network!
+        SeasonRepository::new(&pool)
+            .upsert(CreateSeason {
+                season_id: 202601,
+                year: 2026,
+                season: "WINTER".to_string(),
+                name: None,
+            })
+            .await
+            .unwrap();
+        MalAnimeRepository::new(&pool)
+            .upsert(UpsertMalAnime {
+                mal_id: 701,
+                title: "Promo PV".to_string(),
+                media_type: "pv".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let _ = bgm.url();
+        let db = test_db(pool.clone());
+        let app = admin_router(state_with_bgm_url(db, &bgm.url()));
+
+        // 1. Manual add existing mal_id=701 into 202601
+        let add_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/seasons/202601/mal")
+                    .header("Authorization", admin_token())
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"mal_id":701,"note":"manual add"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(add_resp.status(), StatusCode::OK);
+
+        // 2. Match season SSE
+        let match_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/seasons/202601/match")
+                    .header("Authorization", admin_token())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(match_resp.status(), StatusCode::OK);
+        let sse_bytes = axum::body::to_bytes(match_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let sse_text = std::str::from_utf8(&sse_bytes).unwrap();
+        assert!(sse_text.contains(r#""type":"done""#));
+        assert!(sse_text.contains(r#""excluded":1"#));
+
+        // 3. Batch rerun SSE resets to pending then re-matches
+        let rerun_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/matches/rerun")
+                    .header("Authorization", admin_token())
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"mal_ids":[701],"reset_to_pending":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rerun_resp.status(), StatusCode::OK);
+        let rerun_bytes = axum::body::to_bytes(rerun_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rerun_text = std::str::from_utf8(&rerun_bytes).unwrap();
+        assert!(rerun_text.contains(r#""type":"done""#));
+        assert!(rerun_text.contains(r#""excluded":1"#));
     }
 }

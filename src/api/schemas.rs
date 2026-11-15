@@ -169,3 +169,38 @@ pub struct SeasonTop1Item {
     pub season_id: i32,
     pub subject: PublicSubjectItem,
 }
+
+#[derive(Deserialize)]
+pub struct BgmSearchQuery {
+    pub q: String,
+}
+
+#[derive(Deserialize)]
+pub struct AddSeasonMalRequest {
+    pub mal_id: i32,
+    pub note: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct FetchSeasonMalResponse {
+    pub season_id: i32,
+    pub fetched: usize,
+    pub new: usize,
+}
+
+#[derive(Deserialize, Default)]
+pub struct MatchSeasonQuery {
+    #[serde(default)]
+    pub retry: bool,
+}
+
+#[derive(Deserialize)]
+pub struct BatchRerunRequest {
+    pub mal_ids: Vec<i32>,
+    #[serde(default = "default_true")]
+    pub reset_to_pending: bool,
+}
+
+fn default_true() -> bool {
+    true
+}

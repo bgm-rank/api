@@ -125,6 +125,38 @@ impl MalClient {
         Ok(resp.json::<MalSeasonalResponse>().await?)
     }
 
+    /// 获取单条 MAL 番剧详情（404 返回 Ok(None)）。
+    pub async fn get_anime(&self, mal_id: i32) -> Result<Option<MalAnimeNode>> {
+        let url = format!("{}/anime/{}", self.base_url, mal_id);
+        let params = vec![("fields", FIELDS.to_string()), ("nsfw", "true".to_string())];
+        let mut last_status = None;
+        for attempt in 1..=MAX_RETRIES {
+            let resp = self.client.get(&url).query(&params).send().await?;
+            let status = resp.status();
+            if status == StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            if matches!(status.as_u16(), 307 | 429 | 500 | 502 | 503) {
+                last_status = Some(status);
+                if attempt < MAX_RETRIES {
+                    tokio::time::sleep(self.retry_delay * attempt).await;
+                }
+                continue;
+            }
+            if !status.is_success() {
+                bail!("MAL get_anime({}) failed with status {}", mal_id, status);
+            }
+            return Ok(Some(resp.json::<MalAnimeNode>().await?));
+        }
+        let status = last_status.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        bail!(
+            "MAL get_anime({}) failed after {} attempts: {}",
+            mal_id,
+            MAX_RETRIES,
+            status
+        )
+    }
+
     /// 获取指定季度的所有新番（自动分页）。
     pub async fn get_all_seasonal_anime(
         &self,

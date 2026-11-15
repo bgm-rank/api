@@ -205,6 +205,40 @@ pub enum MatchOutcome {
     Failed,
 }
 
+impl MatchOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Included => "included",
+            Self::Excluded => "excluded",
+            Self::Pending => "pending",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum MatchProgressEvent {
+    Progress {
+        total: usize,
+        done: usize,
+        mal_id: i32,
+        outcome: &'static str,
+    },
+    Done {
+        season_id: Option<i32>,
+        total: usize,
+        skipped: usize,
+        included: usize,
+        excluded: usize,
+        pending: usize,
+        failed: usize,
+    },
+    Error {
+        message: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MatchSummary {
     pub total: usize,
@@ -329,13 +363,25 @@ impl MatcherService {
 
     /// 处理季度内所有未移除的 `season_mal`。单条失败不中断整体。
     pub async fn match_season(&self, season_id: i32, retry: bool) -> Result<MatchSummary> {
+        self.match_season_with_progress(season_id, retry, None)
+            .await
+    }
+
+    /// 处理季度内所有未移除的 `season_mal`，可选推送 SSE 进度事件。
+    pub async fn match_season_with_progress(
+        &self,
+        season_id: i32,
+        retry: bool,
+        progress_tx: Option<tokio::sync::mpsc::Sender<MatchProgressEvent>>,
+    ) -> Result<MatchSummary> {
         parse_season_id(season_id)?;
         let rows = SeasonMalRepository::new(self.db.pool())
             .list_by_season(season_id, false)
             .await?;
+        let total = rows.len();
         let mut summary = MatchSummary::default();
         let mut has_hydrated = false;
-        for row in rows {
+        for (idx, row) in rows.into_iter().enumerate() {
             let outcome = match self
                 .match_one(row.mal_id, retry, Some(season_id), &mut has_hydrated)
                 .await
@@ -347,6 +393,111 @@ impl MatcherService {
                 }
             };
             summary.record(outcome);
+            if let Some(tx) = &progress_tx {
+                let _ = tx
+                    .send(MatchProgressEvent::Progress {
+                        total,
+                        done: idx + 1,
+                        mal_id: row.mal_id,
+                        outcome: outcome.as_str(),
+                    })
+                    .await;
+            }
+        }
+        if let Some(tx) = &progress_tx {
+            let _ = tx
+                .send(MatchProgressEvent::Done {
+                    season_id: Some(season_id),
+                    total: summary.total,
+                    skipped: summary.skipped,
+                    included: summary.included,
+                    excluded: summary.excluded,
+                    pending: summary.pending,
+                    failed: summary.failed,
+                })
+                .await;
+        }
+        Ok(summary)
+    }
+
+    /// 批量重置指定 `mal_ids` 为 `pending` 并可选重跑匹配管线（推送进度事件）。
+    pub async fn rerun_mal_ids_with_progress(
+        &self,
+        mal_ids: &[i32],
+        reset_to_pending: bool,
+        progress_tx: Option<tokio::sync::mpsc::Sender<MatchProgressEvent>>,
+    ) -> Result<MatchSummary> {
+        let pool = self.db.pool();
+        if reset_to_pending && !mal_ids.is_empty() {
+            let mut tx = pool.begin().await?;
+            for &mal_id in mal_ids {
+                sqlx::query(
+                    r#"
+                    UPDATE mal_bgm_matches
+                    SET status = 'pending',
+                        source = NULL,
+                        bgm_id = NULL,
+                        confidence = NULL,
+                        reason = NULL,
+                        error = NULL,
+                        updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
+                    WHERE mal_id = ?
+                    "#,
+                )
+                .bind(mal_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+        }
+
+        let total = mal_ids.len();
+        let mut summary = MatchSummary::default();
+        let mut has_hydrated = false;
+        let sm_repo = SeasonMalRepository::new(pool);
+
+        for (idx, &mal_id) in mal_ids.iter().enumerate() {
+            let season = sm_repo
+                .list_by_mal_id(mal_id)
+                .await?
+                .into_iter()
+                .find(|r| !r.is_removed)
+                .map(|r| r.season_id);
+            let outcome = match self
+                .match_one(mal_id, true, season, &mut has_hydrated)
+                .await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::error!(mal_id, error = %format!("{e:#}"), "batch rerun match failed");
+                    MatchOutcome::Failed
+                }
+            };
+            summary.record(outcome);
+            if let Some(tx) = &progress_tx {
+                let _ = tx
+                    .send(MatchProgressEvent::Progress {
+                        total,
+                        done: idx + 1,
+                        mal_id,
+                        outcome: outcome.as_str(),
+                    })
+                    .await;
+            }
+        }
+
+        if let Some(tx) = &progress_tx {
+            let _ = tx
+                .send(MatchProgressEvent::Done {
+                    season_id: None,
+                    total: summary.total,
+                    skipped: summary.skipped,
+                    included: summary.included,
+                    excluded: summary.excluded,
+                    pending: summary.pending,
+                    failed: summary.failed,
+                })
+                .await;
         }
         Ok(summary)
     }

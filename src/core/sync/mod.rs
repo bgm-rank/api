@@ -74,6 +74,10 @@ impl SyncService {
         self.hydrate_delay
     }
 
+    pub fn bangumi_client(&self) -> &BangumiClient {
+        &self.bangumi_client
+    }
+
     pub async fn create_and_sync(
         &self,
         year: i32,

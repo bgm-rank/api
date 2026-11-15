@@ -402,7 +402,7 @@ data: {"type":"error","message":"错误描述"}
 
 ### GET /admin/matches
 
-查询 `mal_bgm_matches` 匹配记录列表，按 `mal_id` 升序排列。每条记录除匹配字段外，同时内联关联的 `mal_anime` 基础字段（`title`、`title_ja`、`media_type`、`rating`）以及已绑定的 `subject` 摘要（未绑定时为 `null`）。
+查询 `mal_bgm_matches` 匹配记录列表，按 `mal_id` 升序排列。每条记录除匹配字段外，同时内联关联的 `mal_anime` 对比字段（`title`、`title_ja`、`title_en`、`media_type`、`rating`、`start_date`、`end_date`、`num_episodes`、`mal_source`、`studios`、`synopsis`）以及已绑定的 `subject` 摘要（未绑定时为 `null`）。
 
 **查询参数**
 
@@ -428,14 +428,27 @@ data: {"type":"error","message":"错误描述"}
     "updated_at": "2026-03-10T08:00:00",
     "title": "Sousou no Frieren",
     "title_ja": "葬送のフリーレン",
+    "title_en": "Frieren: Beyond Journey's End",
     "media_type": "tv",
     "rating": "pg_13",
+    "start_date": "2023-09-29",
+    "end_date": "2024-03-22",
+    "num_episodes": 28,
+    "mal_source": "manga",
+    "studios": "[\"Madhouse\"]",
+    "synopsis": "简介...",
     "subject": {
       "id": 400602,
       "name": "葬送のフリーレン",
       "name_cn": "葬送的芙莉莲",
       "rank": 1,
-      "score": 9.1
+      "score": 9.1,
+      "air_date": "2023-09-29",
+      "platform": "TV",
+      "nsfw": false,
+      "tags": "[\"奇幻\",\"冒险\"]",
+      "summary": "简介...",
+      "images_grid": "https://..."
     }
   }
 ]
@@ -444,13 +457,57 @@ data: {"type":"error","message":"错误描述"}
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `mal_id` ~ `updated_at` | - | `mal_bgm_matches` 匹配字段 |
-| `title` | `string` | `mal_anime.title` |
-| `title_ja` | `string \| null` | `mal_anime.title_ja` |
-| `media_type` | `string` | `mal_anime.media_type` |
-| `rating` | `string \| null` | `mal_anime.rating`（MAL 原始分级） |
-| `subject` | `object \| null` | 绑定的 Bangumi 番剧摘要（`id`、`name`、`name_cn`、`rank`、`score`）；未绑定 `bgm_id` 时为 `null` |
+| `title` / `title_ja` / `title_en` | `string \| null` | `mal_anime` 原标题 / 日文标题 / 英文标题 |
+| `media_type` / `rating` | `string \| null` | `mal_anime` 原始媒体类型与分级 |
+| `start_date` / `end_date` / `num_episodes` | - | `mal_anime` 放送起止日期与集数 |
+| `mal_source` / `studios` / `synopsis` | `string \| null` | `mal_anime.source`（重命名避免与匹配 `source` 冲突）、制作公司 JSON、简介 |
+| `subject` | `object \| null` | 绑定的 Bangumi 番剧摘要（含 `air_date`、`platform`、`nsfw`、`tags`、`summary`、`images_grid`）；未绑定 `bgm_id` 时为 `null` |
 
 **响应 400** — `status` 参数不在允许值内
+
+---
+
+### POST /admin/seasons/{season_id}/fetch-mal
+
+抓取指定季度的 MAL 新番列表并幂等写入 `seasons`、`mal_anime`、`season_mal` 与初始 `pending` 的 `mal_bgm_matches`（需服务端配置 `MAL_CLIENT_ID`）。
+
+**响应 200**：`{ "season_id": 202601, "fetched": 215, "new": 12 }`
+
+---
+
+### POST /admin/seasons/{season_id}/match
+
+执行指定季度的四层自动匹配管线（可选查询参数 `?retry=true` 重跑已处理过的 `pending` 条目），返回 **SSE (`text/event-stream`)** 实时进度流：
+- `data: {"type":"progress","total":215,"done":1,"mal_id":58102,"outcome":"included"}`
+- `data: {"type":"done","season_id":202601,"total":215,"skipped":180,"included":20,"excluded":9,"pending":6,"failed":0}`
+- `data: {"type":"error","message":"..."}`
+
+---
+
+### POST /admin/seasons/{season_id}/mal
+
+手动向指定季度补入单个 `mal_id`（请求体 `{ "mal_id": 58102, "note": "手动补入" }`）。若本地 `mal_anime` 中尚无该条目，将自动调用 MAL API 拉取详情后写入 `season_mal (origin = 'manual', is_removed = 0)` 及 `mal_bgm_matches (pending)`。
+
+**响应 200**：`{ "season_mal": { ... }, "fetched_from_mal": true }`
+
+---
+
+### POST /admin/matches/rerun
+
+批量将指定的 `mal_ids` 重置为 `pending` 并重跑自动匹配管线（请求体 `{ "mal_ids": [101, 102], "reset_to_pending": true }`），返回 **SSE (`text/event-stream`)** 进度事件（格式同 `POST /admin/seasons/{season_id}/match`）。
+
+---
+
+### GET /admin/bgm/search 及 GET /admin/bgm/subjects/{bgm_id}
+
+- `GET /admin/bgm/search?q=<keyword>`：按关键词实时搜索 Bangumi 动画条目（最多返回 10 条），每条附带 `linked_matches`（库内已绑定该 `bgm_id` 的 `mal_id` 及所属季度列表）。
+- `GET /admin/bgm/subjects/{bgm_id}`：预览单个 Bangumi 番剧详情（含 `eps`、`platform`、`air_date`、`score`、`rank`、`tags`、`nsfw`、`summary`、`images_grid` 及 `linked_matches`）。
+
+---
+
+### POST /admin/subjects/{subject_id}/sync
+
+手动重刷单个 Bangumi 番剧的评分、排名、收藏与剧集评论均值，返回更新后的 `Subject` 对象。
 
 ---
 

@@ -3,15 +3,20 @@ use serde::Serialize;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use crate::core::fetch::{FetchSummary, MalFetchService, parse_season_id};
 use crate::core::scheduler::{PublicTickStats, SchedulerHandle};
 use crate::core::sync::SyncService;
 use crate::dal::dto::{
-    MalBgmMatch, MalBgmMatchWithDetails, Season, SeasonMal, Subject, UpdateSeason, UpdateSubject,
+    LinkedMalItem, MalBgmMatch, MalBgmMatchWithDetails, Season, SeasonMal, Subject, UpdateSeason,
+    UpdateSubject,
 };
 use crate::dal::{
-    Database, MalBgmMatchRepository, SeasonMalRepository, SeasonRepository, SubjectRepository,
+    Database, MalAnimeRepository, MalBgmMatchRepository, SeasonMalRepository, SeasonRepository,
+    SubjectRepository,
 };
+use crate::services::bangumi::Subject as BangumiApiSubject;
 use crate::services::deploy_hook::DeployHookClient;
+use crate::services::mal::MalClient;
 
 #[derive(Debug)]
 pub struct SchedulerBusy;
@@ -56,6 +61,29 @@ pub struct PatchMatchResult {
 pub struct MoveSeasonMalResult {
     pub source: SeasonMal,
     pub target: SeasonMal,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BgmPreviewSubject {
+    pub id: i32,
+    pub name: Option<String>,
+    pub name_cn: Option<String>,
+    pub air_date: Option<String>,
+    pub platform: Option<String>,
+    pub eps: Option<i32>,
+    pub score: Option<f64>,
+    pub rank: Option<i32>,
+    pub nsfw: Option<bool>,
+    pub tags: Vec<String>,
+    pub summary: Option<String>,
+    pub images_grid: Option<String>,
+    pub linked_matches: Vec<LinkedMalItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AddManualMalResult {
+    pub season_mal: SeasonMal,
+    pub fetched_from_mal: bool,
 }
 
 pub struct SchedulerStatus {
@@ -426,6 +454,213 @@ impl AdminService {
             .list_for_export()
             .await?;
         to_ndjson(&rows)
+    }
+
+    pub async fn search_bgm_subjects(
+        &self,
+        keyword: &str,
+    ) -> Result<Vec<BgmPreviewSubject>, AdminOpError> {
+        let q = keyword.trim();
+        if q.is_empty() {
+            return Err(AdminOpError::BadRequest(
+                "Query parameter 'q' cannot be empty".to_string(),
+            ));
+        }
+
+        let subjects = self
+            .sync_service
+            .bangumi_client()
+            .search_anime(q, None)
+            .await?;
+        let ids: Vec<i32> = subjects.iter().map(|s| s.id).collect();
+        let linked = MalBgmMatchRepository::new(self.db.pool())
+            .list_linked_by_bgm_ids(&ids)
+            .await?;
+
+        Ok(subjects
+            .into_iter()
+            .map(|s| {
+                let id = s.id;
+                let item_links = linked.iter().filter(|l| l.bgm_id == id).cloned().collect();
+                bgm_api_to_preview(s, item_links)
+            })
+            .collect())
+    }
+
+    pub async fn preview_bgm_subject(
+        &self,
+        bgm_id: i32,
+    ) -> Result<BgmPreviewSubject, AdminOpError> {
+        if bgm_id <= 0 {
+            return Err(AdminOpError::BadRequest(
+                "bgm_id must be greater than 0".to_string(),
+            ));
+        }
+
+        let pool = self.db.pool();
+        let linked = MalBgmMatchRepository::new(pool)
+            .list_linked_by_bgm_ids(&[bgm_id])
+            .await?;
+
+        match self.sync_service.bangumi_client().get_subject(bgm_id).await {
+            Ok(s) => Ok(bgm_api_to_preview(s, linked)),
+            Err(api_err) => {
+                if let Some(local) = SubjectRepository::new(pool).find_by_id(bgm_id).await?
+                    && local.name.is_some()
+                {
+                    let tags: Vec<String> = local
+                        .tags
+                        .as_deref()
+                        .and_then(|t| serde_json::from_str(t).ok())
+                        .unwrap_or_default();
+                    return Ok(BgmPreviewSubject {
+                        id: local.id,
+                        name: local.name,
+                        name_cn: local.name_cn,
+                        air_date: local.air_date,
+                        platform: local.platform,
+                        eps: None,
+                        score: local.score,
+                        rank: local.rank,
+                        nsfw: local.nsfw,
+                        tags,
+                        summary: local.summary,
+                        images_grid: local.images_grid,
+                        linked_matches: linked,
+                    });
+                }
+                let msg = api_err.to_string();
+                if msg.contains("404") {
+                    Err(AdminOpError::NotFound(format!(
+                        "Bangumi subject {} not found",
+                        bgm_id
+                    )))
+                } else {
+                    Err(AdminOpError::Internal(api_err))
+                }
+            }
+        }
+    }
+
+    pub async fn refresh_subject(&self, subject_id: i32) -> Result<Subject, AdminOpError> {
+        if subject_id <= 0 {
+            return Err(AdminOpError::BadRequest(
+                "subject_id must be greater than 0".to_string(),
+            ));
+        }
+        let today = chrono::Utc::now().date_naive();
+        self.sync_service.hydrate_subject(subject_id, today).await?;
+        SubjectRepository::new(self.db.pool())
+            .find_by_id(subject_id)
+            .await?
+            .ok_or_else(|| AdminOpError::NotFound(format!("Subject {} not found", subject_id)))
+    }
+
+    pub async fn add_manual_mal_to_season(
+        &self,
+        season_id: i32,
+        mal_id: i32,
+        note: Option<String>,
+        mal_client: Option<&MalClient>,
+    ) -> Result<AddManualMalResult, AdminOpError> {
+        if mal_id <= 0 {
+            return Err(AdminOpError::BadRequest(
+                "mal_id must be greater than 0".to_string(),
+            ));
+        }
+
+        let pool = self.db.pool();
+        if SeasonRepository::new(pool)
+            .find_by_id(season_id)
+            .await?
+            .is_none()
+        {
+            return Err(AdminOpError::NotFound(format!(
+                "Season {} not found",
+                season_id
+            )));
+        }
+
+        let anime_repo = MalAnimeRepository::new(pool);
+        let mut fetched_from_mal = false;
+        if anime_repo.get(mal_id).await?.is_none() {
+            let client = mal_client.ok_or_else(|| {
+                AdminOpError::BadRequest(
+                    "mal_id is not in local database and MAL_CLIENT_ID is not configured"
+                        .to_string(),
+                )
+            })?;
+            let node = client
+                .get_anime(mal_id)
+                .await?
+                .ok_or_else(|| AdminOpError::NotFound(format!("MAL anime {} not found", mal_id)))?;
+            anime_repo
+                .upsert(crate::core::fetch::to_upsert(node))
+                .await?;
+            fetched_from_mal = true;
+        }
+
+        let season_mal = SeasonMalRepository::new(pool)
+            .insert_manual(season_id, mal_id, note)
+            .await?;
+        MalBgmMatchRepository::new(pool)
+            .insert_pending_ignore(mal_id)
+            .await?;
+
+        Ok(AddManualMalResult {
+            season_mal,
+            fetched_from_mal,
+        })
+    }
+
+    pub async fn fetch_season_mal(
+        &self,
+        season_id: i32,
+        mal_client: Option<MalClient>,
+    ) -> Result<FetchSummary, AdminOpError> {
+        parse_season_id(season_id).map_err(|e| AdminOpError::BadRequest(e.to_string()))?;
+        let client = mal_client.ok_or_else(|| {
+            AdminOpError::BadRequest("MAL_CLIENT_ID is not configured on server".to_string())
+        })?;
+        let svc = MalFetchService::new(Arc::clone(&self.db), client);
+        Ok(svc.fetch_season(season_id).await?)
+    }
+}
+
+fn bgm_api_to_preview(
+    s: BangumiApiSubject,
+    linked_matches: Vec<LinkedMalItem>,
+) -> BgmPreviewSubject {
+    let eps = s
+        .eps
+        .filter(|&e| e > 0)
+        .or(s.total_episodes.filter(|&e| e > 0));
+    let score = s.rating.as_ref().and_then(|r| r.score);
+    let rank = s.rating.as_ref().and_then(|r| r.rank);
+    let images_grid = s
+        .images
+        .and_then(|img| img.grid.or(img.small).or(img.medium));
+    let tags = s
+        .tags
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|t| t.name)
+        .take(10)
+        .collect();
+    BgmPreviewSubject {
+        id: s.id,
+        name: s.name,
+        name_cn: s.name_cn,
+        air_date: s.date,
+        platform: s.platform,
+        eps,
+        score,
+        rank,
+        nsfw: s.nsfw,
+        tags,
+        summary: s.summary,
+        images_grid,
+        linked_matches,
     }
 }
 

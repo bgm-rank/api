@@ -75,7 +75,7 @@ pub fn is_new_anime(node: &MalAnimeNode, year: i32, mal_season: &str) -> bool {
         .is_some_and(|s| s.year == year && s.season.trim().eq_ignore_ascii_case(mal_season))
 }
 
-fn to_upsert(node: MalAnimeNode) -> UpsertMalAnime {
+pub(crate) fn to_upsert(node: MalAnimeNode) -> UpsertMalAnime {
     let studios = if node.studios.is_empty() {
         "[]".to_string()
     } else {

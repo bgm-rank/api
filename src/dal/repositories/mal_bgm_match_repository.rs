@@ -1,9 +1,10 @@
 use super::log_db_error;
 use crate::dal::dto::{
-    MalBgmMatch, MalBgmMatchExportRow, MalBgmMatchWithDetails, MatchSubjectSummary,
+    LinkedMalItem, MalBgmMatch, MalBgmMatchExportRow, MalBgmMatchWithDetails, MatchSubjectSummary,
     UpdateMalBgmMatch,
 };
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use std::collections::HashMap;
 
 #[derive(sqlx::FromRow)]
 struct MatchDetailRow {
@@ -11,13 +12,26 @@ struct MatchDetailRow {
     match_row: MalBgmMatch,
     title: String,
     title_ja: Option<String>,
+    title_en: Option<String>,
     media_type: String,
     rating: Option<String>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    num_episodes: Option<i32>,
+    mal_source: Option<String>,
+    studios: Option<String>,
+    synopsis: Option<String>,
     subject_id: Option<i32>,
     subject_name: Option<String>,
     subject_name_cn: Option<String>,
     subject_rank: Option<i32>,
     subject_score: Option<f64>,
+    subject_air_date: Option<String>,
+    subject_platform: Option<String>,
+    subject_nsfw: Option<bool>,
+    subject_tags: Option<String>,
+    subject_summary: Option<String>,
+    subject_images_grid: Option<String>,
 }
 
 pub struct MalBgmMatchRepository<'a> {
@@ -211,13 +225,26 @@ impl<'a> MalBgmMatchRepository<'a> {
                 m.updated_at,
                 ma.title,
                 ma.title_ja,
+                ma.title_en,
                 ma.media_type,
                 ma.rating,
+                ma.start_date,
+                ma.end_date,
+                ma.num_episodes,
+                ma.source AS mal_source,
+                ma.studios,
+                ma.synopsis,
                 s.id AS subject_id,
                 s.name AS subject_name,
                 s.name_cn AS subject_name_cn,
                 s.rank AS subject_rank,
-                s.score AS subject_score
+                s.score AS subject_score,
+                s.air_date AS subject_air_date,
+                s.platform AS subject_platform,
+                s.nsfw AS subject_nsfw,
+                s.tags AS subject_tags,
+                s.summary AS subject_summary,
+                s.images_grid AS subject_images_grid
             FROM mal_bgm_matches m
             JOIN mal_anime ma ON ma.mal_id = m.mal_id
             LEFT JOIN subjects s ON s.id = m.bgm_id
@@ -252,16 +279,104 @@ impl<'a> MalBgmMatchRepository<'a> {
                     name_cn: r.subject_name_cn,
                     rank: r.subject_rank,
                     score: r.subject_score,
+                    air_date: r.subject_air_date,
+                    platform: r.subject_platform,
+                    nsfw: r.subject_nsfw,
+                    tags: r.subject_tags,
+                    summary: r.subject_summary,
+                    images_grid: r.subject_images_grid,
                 });
                 MalBgmMatchWithDetails {
                     match_row: r.match_row,
                     title: r.title,
                     title_ja: r.title_ja,
+                    title_en: r.title_en,
                     media_type: r.media_type,
                     rating: r.rating,
+                    start_date: r.start_date,
+                    end_date: r.end_date,
+                    num_episodes: r.num_episodes,
+                    mal_source: r.mal_source,
+                    studios: r.studios,
+                    synopsis: r.synopsis,
                     subject,
                 }
             })
+            .collect())
+    }
+
+    pub async fn list_linked_by_bgm_ids(
+        &self,
+        bgm_ids: &[i32],
+    ) -> Result<Vec<LinkedMalItem>, sqlx::Error> {
+        if bgm_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        #[derive(sqlx::FromRow)]
+        struct LinkedRow {
+            mal_id: i32,
+            bgm_id: i32,
+            title: String,
+            title_ja: Option<String>,
+            media_type: String,
+            status: String,
+            season_id: Option<i32>,
+        }
+
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT
+                m.mal_id,
+                m.bgm_id,
+                ma.title,
+                ma.title_ja,
+                ma.media_type,
+                m.status,
+                sm.season_id
+            FROM mal_bgm_matches m
+            JOIN mal_anime ma ON ma.mal_id = m.mal_id
+            LEFT JOIN season_mal sm ON sm.mal_id = m.mal_id AND sm.is_removed = 0
+            WHERE m.bgm_id IN (
+            "#,
+        );
+        let mut separated = qb.separated(", ");
+        for id in bgm_ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(") ORDER BY m.mal_id ASC, sm.season_id ASC");
+
+        let rows = qb
+            .build_query_as::<LinkedRow>()
+            .fetch_all(self.pool)
+            .await
+            .inspect_err(|e| log_db_error("list_linked_by_bgm_ids", "mal_bgm_matches", e))?;
+
+        let mut map: HashMap<i32, LinkedMalItem> = HashMap::new();
+        let mut order: Vec<i32> = Vec::new();
+        for r in rows {
+            let entry = map.entry(r.mal_id).or_insert_with(|| {
+                order.push(r.mal_id);
+                LinkedMalItem {
+                    mal_id: r.mal_id,
+                    bgm_id: r.bgm_id,
+                    title: r.title,
+                    title_ja: r.title_ja,
+                    media_type: r.media_type,
+                    status: r.status,
+                    seasons: Vec::new(),
+                }
+            });
+            if let Some(sid) = r.season_id
+                && !entry.seasons.contains(&sid)
+            {
+                entry.seasons.push(sid);
+            }
+        }
+
+        Ok(order
+            .into_iter()
+            .filter_map(|mal_id| map.remove(&mal_id))
             .collect())
     }
 }
@@ -741,6 +856,7 @@ mod tests {
                 name_cn: Some("葬送的芙莉莲 第二季".to_string()),
                 rank: Some(5),
                 score: Some(8.9),
+                ..Default::default()
             })
         );
         assert_eq!(all[1].match_row.mal_id, 20);

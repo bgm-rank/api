@@ -123,11 +123,17 @@ api
 | `PATCH` | `/admin/seasons/{season_id}` | 修改季度信息（如自定义名称） |
 | `DELETE` | `/admin/seasons/{season_id}` | 删除指定季度及其关联关系 |
 | `POST` | `/admin/seasons/{season_id}/sync` | 重同步指定季度，返回 **SSE (`text/event-stream`)** 实时进度事件 |
+| `POST` | `/admin/seasons/{season_id}/fetch-mal` | 抓取指定季度的 MAL 新番并幂等入库 `mal_anime` / `season_mal` / `mal_bgm_matches` |
+| `POST` | `/admin/seasons/{season_id}/match` | 执行指定季度的自动匹配管线（支持 `?retry=true`），返回 **SSE (`text/event-stream`)** 进度事件 |
+| `POST` | `/admin/seasons/{season_id}/mal` | 手动向指定季度补入单个 `mal_id`（若本地无记录则调用 MAL API 抓取后写入 `origin='manual'`） |
 | `DELETE` | `/admin/seasons/{season_id}/mal/{mal_id}` | 标记某季度的 `season_mal` 行 `is_removed = 1` |
 | `POST` | `/admin/seasons/{season_id}/mal/{mal_id}/move` | 将 `mal_id` 从当前季度移至目标季度（源季标记 `is_removed = 1`，目标季写入 `manual`） |
 | `POST` | `/admin/seasons/{season_id}/mal/{mal_id}/restore` | 恢复某季度被软移除的 `season_mal` 行（`is_removed = 0`，行不存在返回 `404`） |
-| `GET` | `/admin/matches` | 查询匹配记录列表（支持可选 `?season_id=`（关联 `season_mal.is_removed = 0`）与 `?status=` 过滤；返回匹配字段、`mal_anime` 字段及已绑定 `subject` 摘要） |
+| `GET` | `/admin/matches` | 查询匹配记录列表（支持可选 `?season_id=`（关联 `season_mal.is_removed = 0`）与 `?status=` 过滤；返回匹配字段、`mal_anime` 完整对比字段及已绑定 `subject` 摘要） |
+| `POST` | `/admin/matches/rerun` | 批量将指定 `mal_ids` 打回 `pending` 并重跑自动匹配管线，返回 **SSE (`text/event-stream`)** 进度事件 |
 | `PATCH` | `/admin/matches/{mal_id}` | 人工更新匹配状态/绑定 `bgm_id`（`bgm_id > 0` 时确保骨架行；`included`/`excluded` 设 `source = 'human'`，`pending` 重置 `source`/`confidence`/`bgm_id`；`included` 时非致命触发 `hydrate_subject` 并返回 `hydrated: bool`） |
+| `GET` | `/admin/bgm/search` | 按关键词实时搜索 Bangumi 动画条目（`?q=`），附带库内已有 `mal_bgm_matches` 关联列表 |
+| `GET` | `/admin/bgm/subjects/{bgm_id}` | 预览单个 Bangumi 番剧详情（含 `eps`/`platform`/`tags` 及库内共享 `bgm_id` 关联列表） |
 | `GET` | `/admin/export/season_mal` | 导出 `season_mal` 人工覆盖与移除记录（`origin = 'manual' OR is_removed = 1`），返回 `application/x-ndjson` |
 | `GET` | `/admin/export/matches` | 导出全量 `mal_bgm_matches` 匹配记录，返回 `application/x-ndjson` |
 | `GET` | `/admin/subjects/orphans` | 查询未被任何 `mal_bgm_matches.bgm_id IS NOT NULL` 引用的孤儿番剧 |
@@ -135,6 +141,7 @@ api
 | `GET` | `/admin/subjects/{subject_id}` | 获取单个番剧详情 |
 | `PATCH` | `/admin/subjects/{subject_id}` | 手动微调番剧字段 |
 | `DELETE` | `/admin/subjects/{subject_id}` | 删除单个番剧（同事务重置关联 `mal_bgm_matches` 为 `pending`） |
+| `POST` | `/admin/subjects/{subject_id}/sync` | 手动重刷单个 Bangumi 番剧评分、排名与剧集评论均值 |
 | `POST` | `/admin/scheduler/trigger` | 手动触发一次调度器 Tick（若正在运行则返回 `409 Conflict`） |
 | `GET` | `/admin/scheduler/status` | 查询调度器运行状态及上次 Tick 统计信息 |
 | `POST` | `/admin/deploy` | 手动触发 `DEPLOY_HOOK_URL` |

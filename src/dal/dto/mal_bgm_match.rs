@@ -41,13 +41,30 @@ pub struct MalBgmMatchExportRow {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct MatchSubjectSummary {
     pub id: i32,
     pub name: Option<String>,
     pub name_cn: Option<String>,
     pub rank: Option<i32>,
     pub score: Option<f64>,
+    pub air_date: Option<String>,
+    pub platform: Option<String>,
+    pub nsfw: Option<bool>,
+    pub tags: Option<String>,
+    pub summary: Option<String>,
+    pub images_grid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinkedMalItem {
+    pub mal_id: i32,
+    pub bgm_id: i32,
+    pub title: String,
+    pub title_ja: Option<String>,
+    pub media_type: String,
+    pub status: String,
+    pub seasons: Vec<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,7 +73,14 @@ pub struct MalBgmMatchWithDetails {
     pub match_row: MalBgmMatch,
     pub title: String,
     pub title_ja: Option<String>,
+    pub title_en: Option<String>,
     pub media_type: String,
     pub rating: Option<String>,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub num_episodes: Option<i32>,
+    pub mal_source: Option<String>,
+    pub studios: Option<String>,
+    pub synopsis: Option<String>,
     pub subject: Option<MatchSubjectSummary>,
 }
