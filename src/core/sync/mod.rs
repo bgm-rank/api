@@ -70,7 +70,6 @@ impl SyncService {
         self
     }
 
-    #[cfg(test)]
     pub fn hydrate_delay(&self) -> Duration {
         self.hydrate_delay
     }

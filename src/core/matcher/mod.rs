@@ -334,8 +334,12 @@ impl MatcherService {
             .list_by_season(season_id, false)
             .await?;
         let mut summary = MatchSummary::default();
+        let mut has_hydrated = false;
         for row in rows {
-            let outcome = match self.match_one(row.mal_id, retry, Some(season_id)).await {
+            let outcome = match self
+                .match_one(row.mal_id, retry, Some(season_id), &mut has_hydrated)
+                .await
+            {
                 Ok(o) => o,
                 Err(e) => {
                     tracing::error!(season_id, mal_id = row.mal_id, error = %format!("{e:#}"), "match failed");
@@ -355,7 +359,9 @@ impl MatcherService {
             .into_iter()
             .find(|r| !r.is_removed)
             .map(|r| r.season_id);
-        self.match_one(mal_id, retry, season).await
+        let mut has_hydrated = false;
+        self.match_one(mal_id, retry, season, &mut has_hydrated)
+            .await
     }
 
     async fn match_one(
@@ -363,6 +369,7 @@ impl MatcherService {
         mal_id: i32,
         retry: bool,
         season_id: Option<i32>,
+        has_hydrated: &mut bool,
     ) -> Result<MatchOutcome> {
         let pool = self.db.pool();
         let matches = MalBgmMatchRepository::new(pool);
@@ -380,7 +387,9 @@ impl MatcherService {
         // 1. 已决策短路
         match existing.status.as_str() {
             "included" => {
-                self.hydrate_if_skeleton(&existing).await;
+                if let Some(bgm_id) = existing.bgm_id {
+                    self.hydrate_if_skeleton_id(bgm_id, has_hydrated).await;
+                }
                 return Ok(MatchOutcome::Skipped);
             }
             "excluded" => return Ok(MatchOutcome::Skipped),
@@ -433,7 +442,15 @@ impl MatcherService {
         if !subjects.is_empty() {
             state.first_subjects = subjects.clone();
             if let Some(o) = self
-                .try_match(&existing, &mal, &brief, subjects, !korean, &mut state)
+                .try_match(
+                    &existing,
+                    &mal,
+                    &brief,
+                    subjects,
+                    !korean,
+                    &mut state,
+                    has_hydrated,
+                )
                 .await?
             {
                 return Ok(o);
@@ -466,7 +483,15 @@ impl MatcherService {
                             state.first_subjects = found.clone();
                         }
                         if let Some(o) = self
-                            .try_match(&existing, &mal, &brief, found, true, &mut state)
+                            .try_match(
+                                &existing,
+                                &mal,
+                                &brief,
+                                found,
+                                true,
+                                &mut state,
+                                has_hydrated,
+                            )
                             .await?
                         {
                             return Ok(o);
@@ -560,6 +585,7 @@ impl MatcherService {
 
     // ── 精确 + LLM ──
 
+    #[allow(clippy::too_many_arguments)]
     async fn try_match(
         &self,
         existing: &MalBgmMatch,
@@ -568,6 +594,7 @@ impl MatcherService {
         mut subjects: Vec<Cand>,
         allow_llm: bool,
         state: &mut PipelineState,
+        has_hydrated: &mut bool,
     ) -> Result<Option<MatchOutcome>> {
         self.enrich(&mut subjects).await;
 
@@ -592,6 +619,7 @@ impl MatcherService {
                         },
                     )
                     .await?;
+                    self.hydrate_if_skeleton_id(hit.id, has_hydrated).await;
                     return Ok(Some(MatchOutcome::Included));
                 }
                 let hit_id = hit.id;
@@ -695,7 +723,7 @@ impl MatcherService {
                 },
             )
             .await?;
-            self.hydrate(best.bgm_id).await;
+            self.hydrate_if_skeleton_id(best.bgm_id, has_hydrated).await;
             return Ok(Some(MatchOutcome::Included));
         }
 
@@ -797,20 +825,27 @@ impl MatcherService {
         Ok(())
     }
 
-    async fn hydrate(&self, bgm_id: i32) {
+    async fn hydrate(&self, bgm_id: i32, has_hydrated: &mut bool) {
+        let delay = self.sync.hydrate_delay();
+        if *has_hydrated && !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        *has_hydrated = true;
+
         let today = chrono::Utc::now().date_naive();
         if let Err(e) = self.sync.hydrate_subject(bgm_id, today).await {
             tracing::warn!(bgm_id, error = %format!("{e:#}"), "hydrate_subject 失败");
         }
     }
 
-    async fn hydrate_if_skeleton(&self, m: &MalBgmMatch) {
-        let Some(bgm_id) = m.bgm_id else { return };
+    async fn hydrate_if_skeleton_id(&self, bgm_id: i32, has_hydrated: &mut bool) {
         match SubjectRepository::new(self.db.pool())
             .find_by_id(bgm_id)
             .await
         {
-            Ok(Some(s)) if s.last_updated_at.is_none() => self.hydrate(bgm_id).await,
+            Ok(Some(s)) if s.last_updated_at.is_none() => {
+                self.hydrate(bgm_id, has_hydrated).await;
+            }
             Ok(_) => {}
             Err(e) => tracing::warn!(bgm_id, error = %e, "查询 subject 失败"),
         }
@@ -1382,7 +1417,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_exact_included_with_nfkc_and_skeleton(pool: SqlitePool) {
+    async fn test_exact_included_with_nfkc_and_hydrated(pool: SqlitePool) {
         let llm = FakeLlm::new(vec![], Suggest::Keywords(vec![]));
         let mut e = env(pool, Some(llm.clone())).await;
         add_mal(&e.db, 1, "ＡＢＣ　作品", "tv", None, "2026-01-05").await;
@@ -1394,12 +1429,15 @@ mod tests {
             ],
         )
         .await;
+        let (s, ep) = mock_hydrate(&mut e.server, 500, 1).await;
 
         assert_eq!(
             e.service.match_mal(1, false).await.unwrap(),
             MatchOutcome::Included
         );
         m.assert_async().await;
+        s.assert_async().await;
+        ep.assert_async().await;
         assert_eq!(llm.calls(), (0, 0));
         let row = get_match(&e.db, 1).await;
         assert_eq!(row.status, "included");
@@ -1407,7 +1445,28 @@ mod tests {
         assert_eq!(row.bgm_id, Some(500));
         assert_eq!(row.confidence, Some(1.0));
         assert!(row.error.is_none());
-        // 骨架行满足外键，且未被标记为已拉取
+        assert!(last_updated(&e.db, 500).await);
+    }
+
+    #[sqlx::test]
+    async fn test_exact_included_preserves_skeleton_when_hydrate_fails(pool: SqlitePool) {
+        let mut e = env(pool, None).await;
+        add_mal(&e.db, 1, "ABC 作品", "tv", None, "2026-01-05").await;
+        let _m = mock_search(&mut e.server, &[(500, "ABC 作品", "2026-01-05")]).await;
+        let fail = e
+            .server
+            .mock("GET", "/v0/subjects/500")
+            .with_status(503)
+            .create_async()
+            .await;
+
+        assert_eq!(
+            e.service.match_mal(1, false).await.unwrap(),
+            MatchOutcome::Included
+        );
+        fail.assert_async().await;
+        let row = get_match(&e.db, 1).await;
+        assert_eq!((row.status.as_str(), row.bgm_id), ("included", Some(500)));
         assert!(!last_updated(&e.db, 500).await);
     }
 
@@ -1736,6 +1795,7 @@ mod tests {
             .unwrap();
         let _mock_search =
             mock_search(&mut e.server, &[(500, "葬送のフリーレン", "2026-01-05")]).await;
+        let (s, ep) = mock_hydrate(&mut e.server, 500, 1).await;
 
         let summary = e.service.match_season(202601, false).await.unwrap();
         assert_eq!(
@@ -1750,9 +1810,11 @@ mod tests {
         assert_eq!(get_match(&e.db, 3).await.source, None);
         assert_eq!(get_match(&e.db, 3).await.status, "pending");
 
-        // 再跑：均已决策，全部短路
+        // 再跑：均已决策且详情已拉取，全部短路且不重复请求 Bangumi
         let again = e.service.match_season(202601, true).await.unwrap();
         assert_eq!(again.skipped, 2);
+        s.assert_async().await;
+        ep.assert_async().await;
     }
 
     #[sqlx::test]
