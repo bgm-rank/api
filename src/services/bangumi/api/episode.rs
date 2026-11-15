@@ -58,13 +58,41 @@ impl BangumiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mockito::Matcher;
 
     #[tokio::test]
     async fn test_get_episodes() {
-        let client = BangumiClient::new();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v0/episodes")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("subject_id".into(), "400602".into()),
+                Matcher::UrlEncoded("type".into(), "0".into()),
+                Matcher::UrlEncoded("limit".into(), "100".into()),
+                Matcher::UrlEncoded("offset".into(), "0".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "total": 2,
+                    "limit": 100,
+                    "offset": 0,
+                    "data": [
+                        {"id": 1227087, "type": 0, "ep": 1.0, "airdate": "2023-09-29", "comment": 120},
+                        {"id": 1227088, "type": 0, "ep": 2.0, "airdate": "2023-09-29", "comment": 95}
+                    ]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let client = BangumiClient::with_base_url(&server.url());
         let paged_episode = client.get_episodes(400602, 0, 100, 0).await.unwrap();
-        assert_eq!(paged_episode.total, 28);
-        assert_eq!(paged_episode.data.len(), 28);
+        mock.assert_async().await;
+        assert_eq!(paged_episode.total, 2);
+        assert_eq!(paged_episode.data.len(), 2);
         assert_eq!(
             paged_episode.data[0].airdate,
             Some("2023-09-29".to_string())
@@ -74,8 +102,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_bad_episodes_not_found() {
-        let client = BangumiClient::new();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v0/episodes")
+            .match_query(Matcher::Any)
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let client = BangumiClient::with_base_url(&server.url());
         let paged_episode = client.get_episodes(999999999, 0, 100, 0).await;
+        mock.assert_async().await;
         assert!(paged_episode.is_err());
     }
 }

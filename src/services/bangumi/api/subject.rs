@@ -58,8 +58,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_subject() {
-        let client = BangumiClient::new();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v0/subjects/400602")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "id": 400602,
+                    "type": 2,
+                    "name": "葬送のフリーレン",
+                    "name_cn": "葬送的芙莉莲",
+                    "rating": {"rank": 1, "total": 1000, "score": 8.9}
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let client = BangumiClient::with_base_url(&server.url());
         let subject = client.get_subject(400602).await.unwrap();
+        mock.assert_async().await;
 
         assert_eq!(subject.id, 400602);
         assert_eq!(subject.name_cn, Some("葬送的芙莉莲".to_string()));
@@ -68,8 +87,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_bad_subject_not_found() {
-        let client = BangumiClient::new();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v0/subjects/999999999")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let client = BangumiClient::with_base_url(&server.url());
         let subject = client.get_subject(999999999).await;
+        mock.assert_async().await;
 
         assert!(subject.is_err());
     }
@@ -78,8 +105,16 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_api_call_failure_logs_warn_with_subject_id_and_error() {
-        let client = BangumiClient::new();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v0/subjects/999999999")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let client = BangumiClient::with_base_url(&server.url());
         let _ = client.get_subject(999999999).await;
+        mock.assert_async().await;
         assert!(
             logs_contain("subject_id"),
             "API 失败日志应包含 subject_id 字段"
@@ -92,8 +127,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_subject_redirect() {
-        let client = BangumiClient::new();
+        let mut server = mockito::Server::new_async().await;
+        let redirect_mock = server
+            .mock("GET", "/v0/subjects/141079")
+            .with_status(302)
+            .with_header("location", &format!("{}/v0/subjects/104906", server.url()))
+            .create_async()
+            .await;
+        let target_mock = server
+            .mock("GET", "/v0/subjects/104906")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "id": 104906,
+                    "type": 2,
+                    "name": "ワールドトリガー",
+                    "name_cn": "境界触发者",
+                    "rating": {"rank": 200, "total": 500, "score": 7.8}
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let client = BangumiClient::with_base_url(&server.url());
         let subject = client.get_subject(141079).await.unwrap();
+        redirect_mock.assert_async().await;
+        target_mock.assert_async().await;
 
         assert_eq!(subject.id, 104906);
         assert_eq!(subject.name_cn, Some("境界触发者".to_string()));
