@@ -12,7 +12,7 @@ use crate::services::mal::{MalAnimeNode, MalClient};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FetchSummary {
-    /// MAL 返回的条目数
+    /// 当季开播新番条目数（已过滤续播/老番）
     pub fetched: usize,
     /// 新写入 `season_mal` 的行数（已存在/已移除的行不计）
     pub new: usize,
@@ -66,6 +66,13 @@ pub fn season_range(from: i32, to: i32) -> Result<Vec<i32>> {
         };
     }
     Ok(out)
+}
+
+/// 检查 MAL 条目是否为当季开播新番（过滤跨季续播与常年连载老番）。
+pub fn is_new_anime(node: &MalAnimeNode, year: i32, mal_season: &str) -> bool {
+    node.start_season
+        .as_ref()
+        .is_some_and(|s| s.year == year && s.season.trim().eq_ignore_ascii_case(mal_season))
 }
 
 fn to_upsert(node: MalAnimeNode) -> UpsertMalAnime {
@@ -139,6 +146,9 @@ impl MalFetchService {
 
         let mut summary = FetchSummary::default();
         for node in nodes {
+            if !is_new_anime(&node, year, mal_season) {
+                continue;
+            }
             let mal_id = node.id;
             anime_repo.upsert(to_upsert(node)).await?;
             if season_mal_repo.insert_ignore(season_id, mal_id).await? {
@@ -403,5 +413,116 @@ mod tests {
         assert_eq!(m.bgm_id, Some(4242));
         assert_eq!(m.confidence, Some(1.0));
         assert_eq!(m.note.as_deref(), Some("checked"));
+    }
+
+    #[sqlx::test]
+    async fn test_fetch_season_skips_continuing_and_missing_start_season(pool: SqlitePool) {
+        let mut server = Server::new_async().await;
+        // 预先存在一部上一季（202510）已收录的跨季连播番 mal_id=10
+        SeasonRepository::new(&pool)
+            .upsert(CreateSeason {
+                season_id: 202510,
+                year: 2025,
+                season: "FALL".into(),
+                name: None,
+            })
+            .await
+            .unwrap();
+        MalAnimeRepository::new(&pool)
+            .upsert(UpsertMalAnime {
+                mal_id: 10,
+                title: "Two-Cour Show".into(),
+                media_type: "tv".into(),
+                start_season_year: Some(2025),
+                start_season: Some("fall".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        SeasonMalRepository::new(&pool)
+            .insert_ignore(202510, 10)
+            .await
+            .unwrap();
+        crate::dal::SubjectRepository::new(&pool)
+            .create(crate::dal::dto::CreateSubject {
+                id: 8888,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        MalBgmMatchRepository::new(&pool)
+            .upsert(
+                10,
+                UpdateMalBgmMatch {
+                    status: "included".into(),
+                    source: Some("exact".into()),
+                    bgm_id: Some(8888),
+                    confidence: Some(1.0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut continuing = node(10, Some("tv"));
+        continuing["start_season"] = json!({"year": 2025, "season": "fall"});
+        let mut long_running = node(21, Some("tv"));
+        long_running["start_season"] = json!({"year": 1999, "season": "fall"});
+        let mut no_start_season = node(30, Some("ona"));
+        no_start_season
+            .as_object_mut()
+            .unwrap()
+            .remove("start_season");
+        let mut new_winter = node(40, Some("tv"));
+        new_winter["start_season"] = json!({"year": 2026, "season": "WINTER"});
+
+        let body = json!({
+            "data": [
+                {"node": continuing},
+                {"node": long_running},
+                {"node": no_start_season},
+                {"node": new_winter},
+            ],
+            "paging": {}
+        })
+        .to_string();
+
+        let mock = server
+            .mock("GET", "/anime/season/2026/winter")
+            .match_query(Matcher::Any)
+            .with_body(body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let summary = service(pool.clone(), &server)
+            .fetch_season(202601)
+            .await
+            .unwrap();
+        mock.assert_async().await;
+
+        assert_eq!(summary, FetchSummary { fetched: 1, new: 1 });
+        let rows_202601 = SeasonMalRepository::new(&pool)
+            .list_by_season(202601, true)
+            .await
+            .unwrap();
+        assert_eq!(rows_202601.len(), 1);
+        assert_eq!(rows_202601[0].mal_id, 40);
+
+        // 21 与 30 不应写入 mal_anime 或 mal_bgm_matches
+        assert!(
+            MalAnimeRepository::new(&pool)
+                .get(21)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            MalAnimeRepository::new(&pool)
+                .get(30)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
