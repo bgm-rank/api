@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use reqwest::{Client, header};
+use reqwest::{Client, StatusCode, header};
 
 use super::schemas::*;
 
@@ -101,9 +101,75 @@ impl PromptMode {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedLlmConfig {
+    provider: &'static str,
+    api_key: String,
+    base_url: &'static str,
+    model: String,
+    prompt_mode: PromptMode,
+}
+
+fn resolve_llm_config(
+    deepseek_key: Option<&str>,
+    deepseek_model: Option<&str>,
+    openrouter_key: Option<&str>,
+    openrouter_model: Option<&str>,
+    prompt_mode_raw: Option<&str>,
+) -> Option<ResolvedLlmConfig> {
+    fn trimmed(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|s| !s.is_empty())
+    }
+    let prompt_mode = PromptMode::parse(prompt_mode_raw);
+
+    if let Some(api_key) = trimmed(deepseek_key) {
+        let model = trimmed(deepseek_model)
+            .unwrap_or(DEEPSEEK_DEFAULT_MODEL)
+            .to_string();
+        return Some(ResolvedLlmConfig {
+            provider: "deepseek",
+            api_key: api_key.to_string(),
+            base_url: DEEPSEEK_BASE_URL,
+            model,
+            prompt_mode,
+        });
+    }
+
+    if let Some(api_key) = trimmed(openrouter_key) {
+        let model = trimmed(openrouter_model)
+            .unwrap_or(OPENROUTER_DEFAULT_MODEL)
+            .to_string();
+        return Some(ResolvedLlmConfig {
+            provider: "openrouter",
+            api_key: api_key.to_string(),
+            base_url: OPENROUTER_BASE_URL,
+            model,
+            prompt_mode,
+        });
+    }
+
+    None
+}
+
+#[derive(Debug)]
+enum ChatAttemptError {
+    Auth(anyhow::Error),
+    Retryable(anyhow::Error),
+}
+
+impl ChatAttemptError {
+    fn into_parts(self) -> (anyhow::Error, bool) {
+        match self {
+            Self::Auth(err) => (err, false),
+            Self::Retryable(err) => (err, true),
+        }
+    }
+}
+
 /// OpenAI 兼容 chat completions 客户端（DeepSeek / OpenRouter）。
 pub struct LlmClient {
     client: Client,
+    provider: &'static str,
     base_url: String,
     model: String,
     prompt_mode: PromptMode,
@@ -111,12 +177,31 @@ pub struct LlmClient {
 }
 
 impl LlmClient {
+    #[cfg(test)]
     pub fn new(
         api_key: &str,
         base_url: &str,
         model: &str,
         prompt_mode: PromptMode,
     ) -> Result<Self> {
+        Self::new_with_provider("custom", api_key, base_url, model, prompt_mode)
+    }
+
+    fn new_with_provider(
+        provider: &'static str,
+        api_key: &str,
+        base_url: &str,
+        model: &str,
+        prompt_mode: PromptMode,
+    ) -> Result<Self> {
+        let api_key = api_key.trim();
+        if api_key.is_empty() {
+            anyhow::bail!("empty LLM api key");
+        }
+        let model = model.trim();
+        if model.is_empty() {
+            anyhow::bail!("empty LLM model name");
+        }
         let mut headers = header::HeaderMap::new();
         let mut auth = header::HeaderValue::from_str(&format!("Bearer {api_key}"))
             .map_err(|_| anyhow!("invalid LLM api key format"))?;
@@ -129,6 +214,7 @@ impl LlmClient {
             .context("构建 LLM HTTP 客户端失败")?;
         Ok(Self {
             client,
+            provider,
             base_url: base_url.trim_end_matches('/').to_string(),
             model: model.to_string(),
             prompt_mode,
@@ -136,18 +222,54 @@ impl LlmClient {
         })
     }
 
-    /// 读取环境变量：优先 `DEEPSEEK_API_KEY`，否则 `OPENROUTER_API_KEY`；都没有返回 None。
+    #[cfg(test)]
+    pub fn provider(&self) -> &'static str {
+        self.provider
+    }
+
+    #[cfg(test)]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn from_resolved_config(cfg: Option<ResolvedLlmConfig>) -> Result<Option<Self>> {
+        let Some(cfg) = cfg else {
+            return Ok(None);
+        };
+        let client = Self::new_with_provider(
+            cfg.provider,
+            &cfg.api_key,
+            cfg.base_url,
+            &cfg.model,
+            cfg.prompt_mode,
+        )?;
+        tracing::info!(
+            provider = client.provider,
+            model = %client.model,
+            prompt_mode = ?client.prompt_mode,
+            "LLM 客户端已启用"
+        );
+        Ok(Some(client))
+    }
+
+    /// 读取环境变量：优先 `DEEPSEEK_API_KEY`（可选 `DEEPSEEK_MODEL`），
+    /// 否则 `OPENROUTER_API_KEY`（可选 `OPENROUTER_MODEL`）；都没有返回 None。
     /// `LLM_PROMPT_MODE` 取 low（默认）/ high。
     pub fn from_env() -> Result<Option<Self>> {
-        let non_empty = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
-        let mode = PromptMode::parse(std::env::var("LLM_PROMPT_MODE").ok().as_deref());
-        if let Some(key) = non_empty("DEEPSEEK_API_KEY") {
-            return Self::new(&key, DEEPSEEK_BASE_URL, DEEPSEEK_DEFAULT_MODEL, mode).map(Some);
-        }
-        if let Some(key) = non_empty("OPENROUTER_API_KEY") {
-            return Self::new(&key, OPENROUTER_BASE_URL, OPENROUTER_DEFAULT_MODEL, mode).map(Some);
-        }
-        Ok(None)
+        let deepseek_key = std::env::var("DEEPSEEK_API_KEY").ok();
+        let deepseek_model = std::env::var("DEEPSEEK_MODEL").ok();
+        let openrouter_key = std::env::var("OPENROUTER_API_KEY").ok();
+        let openrouter_model = std::env::var("OPENROUTER_MODEL").ok();
+        let prompt_mode = std::env::var("LLM_PROMPT_MODE").ok();
+
+        let cfg = resolve_llm_config(
+            deepseek_key.as_deref(),
+            deepseek_model.as_deref(),
+            openrouter_key.as_deref(),
+            openrouter_model.as_deref(),
+            prompt_mode.as_deref(),
+        );
+        Self::from_resolved_config(cfg)
     }
 
     #[cfg(test)]
@@ -156,7 +278,7 @@ impl LlmClient {
         self
     }
 
-    /// 发送聊天请求（最多 3 次尝试），返回首个 choice 的 content。
+    /// 发送聊天请求（最多 3 次尝试；401/403 鉴权错误不重试），返回首个 choice 的 content。
     async fn chat(&self, system: &str, user: String, max_tokens: u32) -> Result<Option<String>> {
         let url = format!("{}/chat/completions", self.base_url);
         let body = ChatRequest {
@@ -188,9 +310,21 @@ impl LlmClient {
                     }
                     return Ok(choice.message.and_then(|m| m.content));
                 }
-                Err(e) => {
-                    tracing::warn!(attempt, max = MAX_ATTEMPTS, error = %e, "LLM 请求失败");
+                Err(attempt_err) => {
+                    let (e, retryable) = attempt_err.into_parts();
+                    tracing::warn!(
+                        provider = self.provider,
+                        model = %self.model,
+                        attempt,
+                        max = MAX_ATTEMPTS,
+                        retryable,
+                        error = %e,
+                        "LLM 请求失败"
+                    );
                     last_err = e;
+                    if !retryable {
+                        break;
+                    }
                     if attempt < MAX_ATTEMPTS && !self.retry_delay.is_zero() {
                         tokio::time::sleep(self.retry_delay).await;
                     }
@@ -200,22 +334,32 @@ impl LlmClient {
         Err(last_err)
     }
 
-    async fn chat_once(&self, url: &str, body: &ChatRequest) -> Result<ChatResponse> {
+    async fn chat_once(
+        &self,
+        url: &str,
+        body: &ChatRequest,
+    ) -> std::result::Result<ChatResponse, ChatAttemptError> {
         let resp = self
             .client
             .post(url)
             .json(body)
             .send()
             .await
-            .context("发送 LLM 请求失败")?;
+            .context("发送 LLM 请求失败")
+            .map_err(ChatAttemptError::Retryable)?;
         let status = resp.status();
         if !status.is_success() {
             // 不回显响应体，避免意外带出敏感信息
-            anyhow::bail!("LLM API 返回错误状态码: {status}");
+            let err = anyhow!("LLM API ({}) 返回错误状态码: {status}", self.provider);
+            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                return Err(ChatAttemptError::Auth(err));
+            }
+            return Err(ChatAttemptError::Retryable(err));
         }
         resp.json::<ChatResponse>()
             .await
             .context("解析 LLM 响应失败")
+            .map_err(ChatAttemptError::Retryable)
     }
 
     pub(crate) fn build_match_input(&self, mal: &MalBrief, candidates: &[BgmCandidate]) -> String {
@@ -596,5 +740,91 @@ mod tests {
         let c = client(&server.url(), PromptMode::Low);
         assert!(c.suggest_search("x", "tv").await.is_err());
         m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_401_unauthorized_fails_immediately_without_retry() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/chat/completions")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        let c = LlmClient::new_with_provider(
+            "openrouter",
+            "  sk-test-trimmed  ",
+            &server.url(),
+            "  deepseek/deepseek-v3.2  ",
+            PromptMode::Low,
+        )
+        .unwrap()
+        .with_retry_delay(Duration::ZERO);
+        let err = c.suggest_search("x", "tv").await.unwrap_err().to_string();
+        assert!(err.contains("openrouter"));
+        assert!(err.contains("401"));
+        m.assert_async().await;
+    }
+
+    #[test]
+    fn test_resolve_llm_config_models_and_priority() {
+        // 1. OpenRouter 自定义模型 + trim
+        let cfg = resolve_llm_config(
+            Some("   "),
+            Some("deepseek-reasoner"),
+            Some("  or-fake-token  "),
+            Some("  deepseek/deepseek-v3.2  "),
+            Some("high"),
+        )
+        .unwrap();
+        assert_eq!(cfg.provider, "openrouter");
+        assert_eq!(cfg.api_key, "or-fake-token");
+        assert_eq!(cfg.base_url, OPENROUTER_BASE_URL);
+        assert_eq!(cfg.model, "deepseek/deepseek-v3.2");
+        assert_eq!(cfg.prompt_mode, PromptMode::High);
+
+        // 2. OpenRouter 未配置模型时回退默认模型
+        let cfg_default =
+            resolve_llm_config(None, None, Some("or-fake-token"), Some("  "), None).unwrap();
+        assert_eq!(cfg_default.provider, "openrouter");
+        assert_eq!(cfg_default.model, OPENROUTER_DEFAULT_MODEL);
+        assert_eq!(cfg_default.prompt_mode, PromptMode::Low);
+
+        // 3. DeepSeek 优先于 OpenRouter，且支持 DEEPSEEK_MODEL 覆盖
+        let cfg_ds = resolve_llm_config(
+            Some("ds-fake-token"),
+            Some("deepseek-reasoner"),
+            Some("or-fake-token"),
+            Some("deepseek/deepseek-v3.2"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg_ds.provider, "deepseek");
+        assert_eq!(cfg_ds.api_key, "ds-fake-token");
+        assert_eq!(cfg_ds.base_url, DEEPSEEK_BASE_URL);
+        assert_eq!(cfg_ds.model, "deepseek-reasoner");
+
+        // 4. 两者都未设置时返回 None
+        assert!(resolve_llm_config(None, Some("m"), Some(""), Some("m2"), None).is_none());
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_startup_log_prints_provider_and_model_without_leaking_key() {
+        let fake_secret = "super-secret-llm-key-do-not-leak";
+        let cfg = resolve_llm_config(
+            None,
+            None,
+            Some(fake_secret),
+            Some("deepseek/deepseek-v3.2"),
+            Some("high"),
+        );
+        let client = LlmClient::from_resolved_config(cfg).unwrap().unwrap();
+        assert_eq!(client.provider(), "openrouter");
+        assert_eq!(client.model(), "deepseek/deepseek-v3.2");
+        assert!(logs_contain("LLM 客户端已启用"));
+        assert!(logs_contain("openrouter"));
+        assert!(logs_contain("deepseek/deepseek-v3.2"));
+        assert!(!logs_contain(fake_secret));
     }
 }

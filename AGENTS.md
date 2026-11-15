@@ -158,7 +158,9 @@ api
 | `DEPLOY_HOOK_URL` | 否 | 无 | 同步完成后触发的前端构建 Webhook URL |
 | `MAL_CLIENT_ID` | `fetch-mal` 必填 | - | MAL API Client ID（请求头 `X-MAL-CLIENT-ID`，严禁写入日志） |
 | `DEEPSEEK_API_KEY` | `match` 可选 | 无 | DeepSeek API Key（优先于 OpenRouter；严禁写入日志） |
+| `DEEPSEEK_MODEL` | 否 | `deepseek-chat` | 使用 DeepSeek 时的模型名覆盖（为空或未设时取默认值） |
 | `OPENROUTER_API_KEY` | `match` 可选 | 无 | OpenRouter API Key（未设 `DEEPSEEK_API_KEY` 时使用；两者都未设则跳过 LLM 层；严禁写入日志） |
+| `OPENROUTER_MODEL` | 否 | `google/gemini-2.5-flash-lite` | 使用 OpenRouter 时的模型名覆盖（如 `deepseek/deepseek-v3.2`；为空或未设时取默认值） |
 | `LLM_PROMPT_MODE` | 否 | `low` | LLM prompt 丰富度 `low` / `high`（`high` 输入 token 约 2.5~3 倍） |
 | `RUST_LOG` | 否 | `info` | `tracing` 日志过滤级别（如 `debug`, `info`） |
 

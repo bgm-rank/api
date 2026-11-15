@@ -68,10 +68,14 @@ impl AppState {
         let handle = SchedulerHandle::new();
         let deploy_hook_url = std::env::var("DEPLOY_HOOK_URL").ok();
         let sync_service = Arc::new(SyncService::new(Arc::clone(&db)));
-        let llm: Option<Arc<dyn LlmMatcher>> = LlmClient::from_env()
-            .ok()
-            .flatten()
-            .map(|c| Arc::new(c) as Arc<dyn LlmMatcher>);
+        let llm: Option<Arc<dyn LlmMatcher>> = match LlmClient::from_env() {
+            Ok(Some(c)) => Some(Arc::new(c)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "LLM 客户端初始化失败，将跳过 LLM 匹配层");
+                None
+            }
+        };
         let matcher_service = Arc::new(MatcherService::new(
             Arc::clone(&db),
             Arc::clone(&sync_service),
