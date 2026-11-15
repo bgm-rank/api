@@ -1,5 +1,7 @@
 pub mod admin;
+pub mod fetch;
 pub mod import;
+pub mod matcher;
 pub mod query;
 pub mod scheduler;
 pub mod sync;

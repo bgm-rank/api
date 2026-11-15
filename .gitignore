@@ -16,4 +16,5 @@ mutants.out.old/
 *.db
 *.db-shm
 *.db-wal
+*.db.bak
 /data/

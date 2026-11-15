@@ -37,6 +37,7 @@ api
     │       └── auth.rs         # 管理员 Bearer Token 鉴权中间件 (`require_admin_token`)
     ├── core/                   # 核心业务逻辑层 (Domain Services)
     │   ├── mod.rs
+    │   ├── matcher/mod.rs      # MatcherService：MAL→BGM 四层匹配管线（规则/搜索/精确/LLM）
     │   ├── import/mod.rs       # ImportService (`import_season_data`)：从旧 season.db 一次性迁移数据
     │   ├── query/mod.rs        # QueryService：公开接口的数据查询与聚合组装
     │   ├── sync/mod.rs         # SyncService：番剧拉取、指标计算与 SSE 同步流
@@ -61,7 +62,8 @@ api
     │       └── subject_repository.rs
     └── services/               # 外部服务客户端层
         ├── mod.rs
-        ├── bangumi/            # Bangumi v0 API 客户端 (`GET /v0/subjects/{id}`, `GET /v0/episodes`)
+        ├── bangumi/            # Bangumi v0 API 客户端 (`GET /v0/subjects/{id}`, `GET /v0/episodes`, `POST /v0/search/subjects`)
+        ├── llm/                # OpenAI 兼容 LLM 客户端 (`LlmClient`，trait `LlmMatcher`：`match_anime` / `suggest_search`)
         └── deploy_hook/        # 外部部署 Webhook 触发客户端 (`DeployHookClient`)
 ```
 
@@ -83,6 +85,7 @@ api
      - `air_weekday`: 从 Infobox 中提取放送星期
      - 支持通过 `mpsc::Sender<SyncProgressEvent>` 推送实时同步进度。
    - **`SchedulerService`**: 在 UTC+8 的 `0, 4, 8, 12, 16, 20` 整点唤醒（或通过 `SchedulerHandle` 手动唤醒）。每次 Tick 根据季度距离（`age`）按不同时间间隔刷新到期番剧，最后触发 Deploy Hook（手动触发除外）。使用 `AtomicBool` 防止重入并发。
+   - **`MatcherService`** (`core/matcher`): `match_mal(mal_id, retry)` / `match_season(season_id, retry)`，按 `docs/drop-season-data-analysis.md` §2 的四层管线写 `mal_bgm_matches`（已 included/excluded 短路；韩文标题只允许精确匹配且不调用 LLM；LLM `confidence >= 0.85` 且无 `match_conflicts` 才自动 included 并 `hydrate_subject`）。LLM 通过 `LlmMatcher` trait 注入，测试使用 fake。
    - **`AdminService`**: 封装管理员对季度、番剧、匹配审核、`season_mal` 跨季移动的修改/删除，JSONL 导出（`export_season_mal_jsonl`、`export_matches_jsonl`），以及对调度器和 Deploy Hook 的控制。
    - **`import` 模块 (`import_season_data`)**: 供 `main.rs` 的一次性 `import-season-data` CLI 子命令调用，在单事务中从旧 `season.db`（及可选原始 MAL JSON 目录）幂等迁移 `seasons`、`subjects` 骨架、`mal_anime`、`season_mal` 与 `mal_bgm_matches`。
 3. **DAL 数据访问层 (`src/dal/`)**
@@ -143,6 +146,10 @@ api
 | `ADMIN_TOKEN` | 是 | - | `/admin/*` 接口鉴权所需的 Bearer Token（缺失或为空时服务拒绝启动，中间件亦拒绝所有请求） |
 | `BGM_TOKEN` | 否 | 无 | Bangumi API 访问令牌（用于提升速率限制或访问受限条目） |
 | `DEPLOY_HOOK_URL` | 否 | 无 | 同步完成后触发的前端构建 Webhook URL |
+| `MAL_CLIENT_ID` | `fetch-mal` 必填 | - | MAL API Client ID（请求头 `X-MAL-CLIENT-ID`，严禁写入日志） |
+| `DEEPSEEK_API_KEY` | `match` 可选 | 无 | DeepSeek API Key（优先于 OpenRouter；严禁写入日志） |
+| `OPENROUTER_API_KEY` | `match` 可选 | 无 | OpenRouter API Key（未设 `DEEPSEEK_API_KEY` 时使用；两者都未设则跳过 LLM 层；严禁写入日志） |
+| `LLM_PROMPT_MODE` | 否 | `low` | LLM prompt 丰富度 `low` / `high`（`high` 输入 token 约 2.5~3 倍） |
 | `RUST_LOG` | 否 | `info` | `tracing` 日志过滤级别（如 `debug`, `info`） |
 
 ---
@@ -155,6 +162,8 @@ api
 - **运行全部测试**: `cargo test`
 - **代码格式检查与修复**: `cargo fmt`
 - **静态分析与 Lint**: `cargo clippy`
+- **MAL 抓取 CLI**: `cargo run -- fetch-mal --season 202601`（或 `--from 202510 --to 202601`；需 `DATABASE_URL`、`MAL_CLIENT_ID`），由 `core/fetch` 的 `MalFetchService` + `services/mal` 的 `MalClient` 实现
+- **匹配 CLI**: `cargo run -- match --season 202601 [--retry]` 或 `cargo run -- match --mal-id <id> [--retry]`（需 `DATABASE_URL`；可选 `DEEPSEEK_API_KEY` / `OPENROUTER_API_KEY` / `LLM_PROMPT_MODE`；`--mal-id` 同样接受 `--retry`），由 `core/matcher` 的 `MatcherService` 实现
 - **一次性数据迁移 CLI**: `cargo run -- import-season-data --season-db <path> [--mal-json-dir <dir>]`（需配置 `DATABASE_URL`）
 
 ### 6.2 测试规范 (TDD)

@@ -154,14 +154,20 @@ pub struct Subject {
 // 搜索筛选器
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchFilter {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub _type: Option<Vec<i32>>, // 条目类型
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub meta_tags: Option<Vec<String>>, // 元标签
-    pub tag: Option<Vec<String>>,       // 标签
-    pub air_date: Option<Vec<String>>,  // 播出日期
-    pub rating: Option<Vec<String>>,    // 评分
-    pub rank: Option<Vec<String>>,      // 排名
-    pub nsfw: Option<bool>,             // 是否包含NSFW内容
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<Vec<String>>, // 标签
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub air_date: Option<Vec<String>>, // 播出日期
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rating: Option<Vec<String>>, // 评分
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank: Option<Vec<String>>, // 排名
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nsfw: Option<bool>, // 是否包含NSFW内容
 }
 
 impl SearchFilter {
@@ -185,6 +191,7 @@ pub struct SearchRequest {
     pub keyword: String, // 搜索关键字
     #[serde(default = "default_sort")]
     pub sort: String, // 排序规则：match=匹配度, heat=收藏人数, rank=排名, score=评分
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<SearchFilter>, // 筛选条件
 }
 
