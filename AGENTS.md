@@ -86,7 +86,7 @@ api
      - `average_comment`: 已放送正片剧集的评论数均值
      - `air_weekday`: 从 Infobox 中提取放送星期
      - 支持通过 `mpsc::Sender<SyncProgressEvent>` 推送实时同步进度。
-   - **`SchedulerService`**: 在 UTC+8 的 `0, 4, 8, 12, 16, 20` 整点唤醒（或通过 `SchedulerHandle` 手动唤醒）。每次 Tick 根据季度距离（`age`）按不同时间间隔刷新到期番剧，最后触发 Deploy Hook（手动触发除外）。使用 `AtomicBool` 防止重入并发。
+   - **`SchedulerService`**: 每日在 UTC+8 的 `04:00` 整点唤醒（或通过 `SchedulerHandle` 手动唤醒）。每次 Tick 根据季度距离（`age`）按不同时间间隔刷新到期番剧，最后触发 Deploy Hook（手动触发除外）。使用 `AtomicBool` 防止重入并发。
    - **`MalFetchService`** (`core/fetch`): `fetch_season(season_id)` / `fetch_range(from, to)`，拉取 MAL 季度列表并按 `is_new_anime` 过滤非当季开播的续播/长篇番剧，幂等写入 `mal_anime`、`season_mal`（`ON CONFLICT DO NOTHING`）与 `mal_bgm_matches` 初始 `pending` 行。
    - **`MatcherService`** (`core/matcher`): `match_mal(mal_id, retry)` / `match_season(season_id, retry)`，按 `docs/drop-season-data-analysis.md` §2 的四层管线写 `mal_bgm_matches`（已 included/excluded 短路；韩文标题只允许精确匹配且不调用 LLM；精确匹配与 LLM `confidence >= 0.85` 均需通过本地 `enrich` 后的 `match_conflicts` 硬规则校验才自动 included 并按需触发 `hydrate_subject`）。LLM 通过 `LlmMatcher` trait 注入，测试使用 fake。
    - **`AdminService`**: 封装管理员对季度、番剧、匹配审核、`season_mal` 跨季移动的修改/删除，JSONL 导出（`export_season_mal_jsonl`、`export_matches_jsonl`），以及对调度器和 Deploy Hook 的控制。
