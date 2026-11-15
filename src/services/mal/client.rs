@@ -66,6 +66,10 @@ impl MalClient {
         c
     }
 
+    pub fn request_interval(&self) -> Duration {
+        self.request_interval
+    }
+
     async fn get(&self, url: &str, params: &[(&str, String)]) -> Result<reqwest::Response> {
         let mut last_status = None;
         for attempt in 1..=MAX_RETRIES {

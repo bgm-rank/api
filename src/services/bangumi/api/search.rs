@@ -1,8 +1,10 @@
 use crate::services::bangumi::{BangumiClient, schemas::*};
 use anyhow::{Context, Result};
 
+const SEARCH_MAX_ATTEMPTS: u32 = 3;
+
 impl BangumiClient {
-    /// 搜索条目
+    /// 搜索条目（对瞬时 429 / 5xx 错误自动退避重试）
     ///
     /// POST /v0/search/subjects?limit=&offset=
     pub async fn search_subjects(
@@ -21,31 +23,59 @@ impl BangumiClient {
             query.push(("offset", o));
         }
 
-        let start = std::time::Instant::now();
-        let response = self
-            .client
-            .post(url.as_str())
-            .query(&query)
-            .json(request)
-            .send()
-            .await
-            .inspect_err(|e| {
-                tracing::warn!(url = %url, error = %e, "bangumi search failed");
-            })
-            .context("发送搜索请求失败")?;
+        for attempt in 1..=SEARCH_MAX_ATTEMPTS {
+            let start = std::time::Instant::now();
+            let send_res = self
+                .client
+                .post(url.as_str())
+                .query(&query)
+                .json(request)
+                .send()
+                .await;
 
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        let status_code = response.status().as_u16();
-        if !response.status().is_success() {
-            tracing::warn!(url = %url, elapsed_ms, status_code, "bangumi search failed");
-            anyhow::bail!("搜索 API 返回错误状态码: {}", response.status());
+            let response = match send_res {
+                Ok(resp) => resp,
+                Err(e) => {
+                    tracing::warn!(url = %url, attempt, error = %e, "bangumi search failed");
+                    if attempt < SEARCH_MAX_ATTEMPTS {
+                        if !self.retry_delay.is_zero() {
+                            tokio::time::sleep(self.retry_delay * attempt).await;
+                        }
+                        continue;
+                    }
+                    return Err(e).context("发送搜索请求失败");
+                }
+            };
+
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let status = response.status();
+            let status_code = status.as_u16();
+            if matches!(status_code, 429 | 500 | 502 | 503 | 504) && attempt < SEARCH_MAX_ATTEMPTS {
+                tracing::warn!(
+                    url = %url,
+                    elapsed_ms,
+                    status_code,
+                    attempt,
+                    "bangumi search transient error, retrying"
+                );
+                if !self.retry_delay.is_zero() {
+                    tokio::time::sleep(self.retry_delay * attempt).await;
+                }
+                continue;
+            }
+            if !status.is_success() {
+                tracing::warn!(url = %url, elapsed_ms, status_code, "bangumi search failed");
+                anyhow::bail!("搜索 API 返回错误状态码: {}", status);
+            }
+            tracing::debug!(url = %url, elapsed_ms, status_code, "bangumi search");
+
+            return response
+                .json::<PagedSubject>()
+                .await
+                .context("解析搜索响应 JSON 失败");
         }
-        tracing::debug!(url = %url, elapsed_ms, status_code, "bangumi search");
 
-        response
-            .json::<PagedSubject>()
-            .await
-            .context("解析搜索响应 JSON 失败")
+        unreachable!()
     }
 
     /// 按关键词搜索动画（含 NSFW），`air_date_range` 为 `(start, end)`：`>=start` 且 `<end`。
@@ -125,15 +155,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_retries_on_transient_status_then_succeeds() {
+        let mut server = mockito::Server::new_async().await;
+        let fail = server
+            .mock("POST", "/v0/search/subjects")
+            .match_query(Matcher::Any)
+            .with_status(429)
+            .expect(2)
+            .create_async()
+            .await;
+        let ok = server
+            .mock("POST", "/v0/search/subjects")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"total":1,"limit":10,"offset":0,"data":[{"id":400602,"type":2,"name":"葬送のフリーレン"}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = BangumiClient::with_base_url(&server.url());
+        let found = client.search_anime("葬送のフリーレン", None).await.unwrap();
+        fail.assert_async().await;
+        ok.assert_async().await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, 400602);
+    }
+
+    #[tokio::test]
     async fn test_search_error_status() {
         let mut server = mockito::Server::new_async().await;
-        server
+        let mock = server
             .mock("POST", "/v0/search/subjects")
             .match_query(Matcher::Any)
             .with_status(500)
+            .expect(3)
             .create_async()
             .await;
         let client = BangumiClient::with_base_url(&server.url());
         assert!(client.search_anime("x", None).await.is_err());
+        mock.assert_async().await;
     }
 }

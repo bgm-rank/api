@@ -170,7 +170,11 @@ impl MalFetchService {
     /// 依次抓取 [from, to]（含）范围内的季度。
     pub async fn fetch_range(&self, from: i32, to: i32) -> Result<FetchSummary> {
         let mut total = FetchSummary::default();
-        for season_id in season_range(from, to)? {
+        let interval = self.client.request_interval();
+        for (idx, season_id) in season_range(from, to)?.into_iter().enumerate() {
+            if idx > 0 && !interval.is_zero() {
+                tokio::time::sleep(interval).await;
+            }
             total += self.fetch_season(season_id).await?;
         }
         Ok(total)
@@ -524,5 +528,34 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[sqlx::test]
+    async fn test_fetch_range_iterates_seasons_with_interval(pool: SqlitePool) {
+        let mut server = Server::new_async().await;
+        let mut fall_node = node(101, Some("tv"));
+        fall_node["start_season"] = json!({"year": 2025, "season": "fall"});
+        let m1 = server
+            .mock("GET", "/anime/season/2025/fall")
+            .match_query(Matcher::Any)
+            .with_body(json!({"data": [{"node": fall_node}], "paging": {}}).to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", "/anime/season/2026/winter")
+            .match_query(Matcher::Any)
+            .with_body(page(&[202], None))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let summary = service(pool, &server)
+            .fetch_range(202510, 202601)
+            .await
+            .unwrap();
+        m1.assert_async().await;
+        m2.assert_async().await;
+        assert_eq!(summary, FetchSummary { fetched: 2, new: 2 });
     }
 }
