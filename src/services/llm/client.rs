@@ -47,14 +47,16 @@ const MATCH_SYSTEM_PROMPT_HIGH: &str = concat!(
 );
 
 const SUGGEST_SYSTEM_PROMPT: &str = concat!(
-    "从MAL动画标题提取用于Bangumi(日本动画数据库)搜索的关键词。只返回JSON。\n",
+    "从MAL动画标题提取用于Bangumi搜索的关键词（含日本动画与国产动画）。只返回JSON。\n",
     "规则:\n",
-    r#"1.JA标题含韩文(한글)或全中文→{"skip":true}"#,
+    r#"1.JA标题含韩文(한글)→{"skip":true}（注意：全汉字/中文标题不可skip）"#,
     "\n",
-    "2.否则从JA标题提取关键词:去掉劇場版/映画前缀、续集标记(第N期/Season)、副标题(～xx～/-xx-/『』)，",
-    r#"保留最具辨识度的日文部分→{"keywords":["关键词"]}"#,
+    "2.否则从JA标题提取关键词:去掉劇場版/映画前缀、续集标记(第N期/第N季/Season)、副标题(～xx～/-xx-/『』)，",
+    r#"保留最具辨识度的核心作品名→{"keywords":["关键词"]}"#,
     "\n例:\n",
     r#"JA:新劇場版 銀魂 -吉原大炎上-→{"keywords":["銀魂 吉原大炎上"]}"#,
+    "\n",
+    r#"JA:犬夜叉 完結編→{"keywords":["犬夜叉"]}"#,
     "\n",
     r#"JA:프린세스 캐치! 티니핑→{"skip":true}"#,
     "\n",
@@ -574,6 +576,12 @@ mod tests {
         assert_eq!(out, Suggest::Keywords(vec!["銀魂".into()]));
         fail.assert_async().await;
         ok.assert_async().await;
+    }
+
+    #[test]
+    fn test_suggest_prompt_does_not_skip_chinese_or_kanji_titles() {
+        assert!(!SUGGEST_SYSTEM_PROMPT.contains("或全中文"));
+        assert!(SUGGEST_SYSTEM_PROMPT.contains("全汉字/中文标题不可skip"));
     }
 
     #[tokio::test]
