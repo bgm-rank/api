@@ -488,6 +488,7 @@ impl MatcherService {
             return Ok(MatchOutcome::Excluded);
         }
 
+        self.enrich(&mut state.first_subjects).await;
         let cands: Vec<CandidateJson> = state
             .first_subjects
             .iter()
@@ -497,7 +498,7 @@ impl MatcherService {
                 air_date: s.date.clone(),
                 confidence: None,
                 reason: None,
-                conflicts: vec![],
+                conflicts: cand_conflicts(&mal, s),
             })
             .collect();
         let error = (!state.errors.is_empty()).then(|| state.errors.join("; "));
@@ -568,6 +569,8 @@ impl MatcherService {
         allow_llm: bool,
         state: &mut PipelineState,
     ) -> Result<Option<MatchOutcome>> {
+        self.enrich(&mut subjects).await;
+
         // 精确层
         if let Some(ja) = mal.title_ja.as_deref().filter(|s| !s.is_empty()) {
             let ja_norm = normalize_title(ja);
@@ -575,12 +578,7 @@ impl MatcherService {
                 .iter()
                 .find(|s| s.name.as_deref().map(normalize_title).as_deref() == Some(&ja_norm));
             if let Some(hit) = hit {
-                let conflicts = match_conflicts(
-                    mal.start_date.as_deref(),
-                    Some(&mal.media_type),
-                    hit.date.as_deref(),
-                    hit.platform.as_deref(),
-                );
+                let conflicts = cand_conflicts(mal, hit);
                 if conflicts.is_empty() {
                     self.ensure_skeleton(hit).await?;
                     self.write(
@@ -605,11 +603,7 @@ impl MatcherService {
                         air_date: s.date.clone(),
                         confidence: (s.id == hit_id).then_some(1.0),
                         reason: None,
-                        conflicts: if s.id == hit_id {
-                            conflicts.clone()
-                        } else {
-                            vec![]
-                        },
+                        conflicts: cand_conflicts(mal, s),
                     })
                     .collect();
                 self.write(
@@ -630,7 +624,6 @@ impl MatcherService {
         let Some(llm) = self.llm.as_ref().filter(|_| allow_llm) else {
             return Ok(None);
         };
-        self.enrich(&mut subjects).await;
         let llm_cands: Vec<BgmCandidate> = subjects
             .iter()
             .map(|s| BgmCandidate {
@@ -669,12 +662,7 @@ impl MatcherService {
             .iter()
             .find(|s| s.id == best.bgm_id)
             .expect("known");
-        let conflicts = match_conflicts(
-            mal.start_date.as_deref(),
-            Some(&mal.media_type),
-            best_subject.date.as_deref(),
-            best_subject.platform.as_deref(),
-        );
+        let conflicts = cand_conflicts(mal, best_subject);
         let cands: Vec<CandidateJson> = known
             .iter()
             .map(|r| {
@@ -685,11 +673,7 @@ impl MatcherService {
                     air_date: s.and_then(|s| s.date.clone()),
                     confidence: r.confidence,
                     reason: r.reason.clone(),
-                    conflicts: if r.bgm_id == best.bgm_id {
-                        conflicts.clone()
-                    } else {
-                        vec![]
-                    },
+                    conflicts: s.map(|s| cand_conflicts(mal, s)).unwrap_or_default(),
                 }
             })
             .collect();
@@ -831,6 +815,15 @@ impl MatcherService {
             Err(e) => tracing::warn!(bgm_id, error = %e, "查询 subject 失败"),
         }
     }
+}
+
+fn cand_conflicts(mal: &MalAnime, s: &Cand) -> Vec<&'static str> {
+    match_conflicts(
+        mal.start_date.as_deref(),
+        Some(&mal.media_type),
+        s.date.as_deref(),
+        s.platform.as_deref(),
+    )
 }
 
 fn excluded(source: &str, reason: Option<&str>) -> UpdateMalBgmMatch {
@@ -1440,6 +1433,72 @@ mod tests {
             serde_json::from_str(row.candidates.as_deref().unwrap()).unwrap();
         assert_eq!(cands[0]["bgm_id"], 500);
         assert_eq!(cands[0]["conflicts"], serde_json::json!(["date"]));
+    }
+
+    #[sqlx::test]
+    async fn test_exact_platform_conflict_from_local_subject_is_pending(pool: SqlitePool) {
+        let llm = FakeLlm::new(vec![], Suggest::Keywords(vec![]));
+        let mut e = env(pool, Some(llm.clone())).await;
+        // 本地已同步一条 TV 动画（日期接近，搜索接口本身不返回 platform）
+        let repo = SubjectRepository::new(e.db.pool());
+        repo.upsert(CreateSubject {
+            id: 500,
+            name: Some("同名作品".into()),
+            air_date: Some("2026-01-05".into()),
+            platform: Some("TV".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        repo.update_last_updated_at(500).await.unwrap();
+
+        // MAL 条目为同名 movie，首播日期在半年内，仅靠 enrich 后的 platform 才能发现冲突
+        add_mal(&e.db, 1, "同名作品", "movie", None, "2026-03-01").await;
+        let _mock_search = mock_search(&mut e.server, &[(500, "同名作品", "2026-01-05")]).await;
+
+        assert_eq!(
+            e.service.match_mal(1, false).await.unwrap(),
+            MatchOutcome::Pending
+        );
+        assert_eq!(llm.calls(), (0, 0));
+        let row = get_match(&e.db, 1).await;
+        assert_eq!(
+            (row.status.as_str(), row.source.as_deref()),
+            ("pending", Some("exact"))
+        );
+        let cands: serde_json::Value =
+            serde_json::from_str(row.candidates.as_deref().unwrap()).unwrap();
+        assert_eq!(cands[0]["conflicts"], serde_json::json!(["platform"]));
+    }
+
+    #[sqlx::test]
+    async fn test_all_candidates_have_conflicts_computed(pool: SqlitePool) {
+        let llm = FakeLlm::new(
+            vec![llm_match(500, 0.7), llm_match(501, 0.4)],
+            Suggest::Skip,
+        );
+        let mut e = env(pool, Some(llm)).await;
+        add_mal(&e.db, 1, "葬送のフリーレン", "tv", None, "2026-01-05").await;
+        let _mock_search = mock_search(
+            &mut e.server,
+            &[
+                (500, "Frieren S2", "2026-01-05"),
+                (501, "Frieren S1", "2023-09-29"),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            e.service.match_mal(1, false).await.unwrap(),
+            MatchOutcome::Pending
+        );
+        let row = get_match(&e.db, 1).await;
+        let cands: serde_json::Value =
+            serde_json::from_str(row.candidates.as_deref().unwrap()).unwrap();
+        assert_eq!(cands[0]["bgm_id"], 500);
+        assert_eq!(cands[0]["conflicts"], serde_json::json!([]));
+        assert_eq!(cands[1]["bgm_id"], 501);
+        assert_eq!(cands[1]["conflicts"], serde_json::json!(["date"]));
     }
 
     #[sqlx::test]
