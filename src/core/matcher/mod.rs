@@ -25,8 +25,8 @@ const DATE_CONFLICT_MONTHS: i32 = 6;
 pub const CONFLICT_DATE: &str = "date";
 pub const CONFLICT_PLATFORM: &str = "platform";
 
-/// 直接排除的 MAL media_type（`unknown` 在源头拦截）。
-const SKIP_MEDIA_TYPES: [&str; 6] = ["pv", "cm", "music", "special", "tv_special", "unknown"];
+/// 直接排除的 MAL media_type（`unknown` 常为尚未公布播出媒介的官宣新番/续作，不在此拦截）。
+const SKIP_MEDIA_TYPES: [&str; 5] = ["pv", "cm", "music", "special", "tv_special"];
 
 // ───────────────────────────── 纯函数 ─────────────────────────────
 
@@ -555,7 +555,9 @@ impl MatcherService {
 
         // 2. 规则层：media_type
         if should_skip_media_type(&mal.media_type) {
-            self.write(&existing, excluded("rule", None)).await?;
+            let reason = format!("media_type:{}", mal.media_type.trim().to_lowercase());
+            self.write(&existing, excluded("rule", Some(&reason)))
+                .await?;
             return Ok(MatchOutcome::Excluded);
         }
 
@@ -610,7 +612,8 @@ impl MatcherService {
 
         // 韩文护栏：精确未命中 -> 直接排除，不调用 LLM
         if korean {
-            self.write(&existing, excluded("rule", None)).await?;
+            self.write(&existing, excluded("rule", Some("korean")))
+                .await?;
             return Ok(MatchOutcome::Excluded);
         }
 
@@ -1120,10 +1123,10 @@ mod tests {
         assert!(!is_hopeless_ona_kids("ona", Some("pg_13")));
         assert!(!is_hopeless_ona_kids("ona", None));
         assert!(!is_hopeless_ona_kids("tv", Some("g")));
-        for t in ["pv", "cm", "music", "special", "tv_special", "unknown"] {
+        for t in ["pv", "cm", "music", "special", "tv_special"] {
             assert!(should_skip_media_type(t), "{t}");
         }
-        for t in ["tv", "ona", "ova", "movie"] {
+        for t in ["tv", "ona", "ova", "movie", "unknown"] {
             assert!(!should_skip_media_type(t), "{t}");
         }
     }
@@ -1505,7 +1508,7 @@ mod tests {
         let llm = FakeLlm::new(vec![], Suggest::Keywords(vec![]));
         let mut e = env(pool, Some(llm.clone())).await;
         let forbid = forbid_search(&mut e.server).await;
-        for (i, t) in ["pv", "cm", "music", "special", "tv_special", "unknown"]
+        for (i, t) in ["pv", "cm", "music", "special", "tv_special"]
             .iter()
             .enumerate()
         {
@@ -1516,13 +1519,37 @@ mod tests {
                 MatchOutcome::Excluded
             );
             let m = get_match(&e.db, id).await;
+            let expected_reason = format!("media_type:{t}");
             assert_eq!(
-                (m.status.as_str(), m.source.as_deref()),
-                ("excluded", Some("rule"))
+                (m.status.as_str(), m.source.as_deref(), m.reason.as_deref()),
+                ("excluded", Some("rule"), Some(expected_reason.as_str()))
             );
         }
         forbid.assert_async().await;
         assert_eq!(llm.calls(), (0, 0));
+    }
+
+    #[sqlx::test]
+    async fn test_unknown_media_type_is_not_excluded_by_rule(pool: SqlitePool) {
+        let llm = FakeLlm::new(vec![], Suggest::Keywords(vec![]));
+        let mut e = env(pool, Some(llm)).await;
+        add_mal(
+            &e.db,
+            63035,
+            "えぶりでいホスト 続編",
+            "unknown",
+            None,
+            "2026-01-05",
+        )
+        .await;
+        let _mock_search = mock_search(&mut e.server, &[]).await;
+
+        assert_eq!(
+            e.service.match_mal(63035, false).await.unwrap(),
+            MatchOutcome::Pending
+        );
+        let m = get_match(&e.db, 63035).await;
+        assert_eq!(m.status, "pending");
     }
 
     #[sqlx::test]
@@ -1542,8 +1569,8 @@ mod tests {
         assert_eq!(llm.calls(), (0, 0));
         let m = get_match(&e.db, 1).await;
         assert_eq!(
-            (m.status.as_str(), m.source.as_deref()),
-            ("excluded", Some("rule"))
+            (m.status.as_str(), m.source.as_deref(), m.reason.as_deref()),
+            ("excluded", Some("rule"), Some("korean"))
         );
         assert!(m.candidates.is_none());
     }

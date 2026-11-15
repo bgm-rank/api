@@ -129,7 +129,7 @@ CREATE INDEX idx_matches_bgm_id ON mal_bgm_matches(bgm_id) WHERE bgm_id IS NOT N
    - 已是 `included` 或 `excluded` → 短路跳过（绝不覆盖人工或已确认决策；若 `status = 'included'` 且关联的 `subjects.last_updated_at IS NULL`，则顺手补拉 Bangumi 详情）。
    - `status = 'pending'` 且 `source IS NOT NULL`（代表已被 LLM 处理过但未达阈值或判无匹配）→ 除非显式传入 `retry = true`，否则短路跳过，避免重复消耗 Token 与 Bangumi 搜索请求。
 2. **第一层：媒体类型与语言规则过滤 (`source = 'rule'`)**：
-   - `media_type` 属于 `pv` / `cm` / `music` / `special` / `tv_special` / `unknown`（源头直接拦截 `unknown`）→ 直接 `status = 'excluded', source = 'rule'`。
+   - `media_type` 属于 `pv` / `cm` / `music` / `special` / `tv_special`（`unknown` 不在此拦截，交由常规匹配或留在 `pending` 待定）→ 直接 `status = 'excluded', source = 'rule'`。
    - **韩文语言护栏（掐 LLM、保 Exact）**：纯谚文标题（含谚文 `[가-힣]` 且不含日文假名，`is_korean_title`）只允许走日文/原文精确匹配；若精确匹配未命中，**不调用 LLM**，直接 `status = 'excluded', source = 'rule'`。（注：绝不对中文/汉字标题设护栏，避免误杀国产动画与全汉字日漫）。
 3. **第二层：Bangumi 多级降级搜索 (`_search_bgm`)**：
    - 按顺序尝试：`带季度日期范围搜索` → `不带日期范围搜索` → `正则剥离后缀（第N期、Season N、劇場版、～副标题～ 等）后重试` → `调用 LLM suggest_search 获取搜索词`。
